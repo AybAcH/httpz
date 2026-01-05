@@ -10,3 +10,9 @@
  (package httpl)
  (libraries httpl core core_unix core_unix.command_unix threads magic-mime)
  (preprocess (pps ppx_jane)))
+
+(executable
+ (name httpz_server)
+ (public_name httpz_server)
+ (package httpl)
+ (libraries httpz core core_unix))

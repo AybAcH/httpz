@@ -573,3 +573,221 @@ let header_name_to_string buf = function
   | H_x_request_id -> "X-Request-Id"
   | H_x_correlation_id -> "X-Correlation-Id"
   | H_other sp -> span_to_string buf sp
+
+(* Body handling *)
+let body_in_buffer buf ~len ~body_off (headers @ local) =
+  if is_chunked buf headers then false
+  else
+    let cl = content_length buf headers in
+    if Int64.(<=) cl 0L then true
+    else
+      let body_end = body_off + Int64.to_int_exn cl in
+      body_end <= len
+
+let body_span buf ~len ~body_off (headers @ local) =
+  if is_chunked buf headers then #{ off = 0; len = -1 }
+  else
+    let cl = content_length buf headers in
+    if Int64.(<=) cl 0L then #{ off = body_off; len = 0 }
+    else
+      let body_len = Int64.to_int_exn cl in
+      let body_end = body_off + body_len in
+      if body_end <= len then #{ off = body_off; len = body_len }
+      else #{ off = 0; len = -1 }
+
+let body_bytes_needed buf ~len ~body_off (headers @ local) =
+  if is_chunked buf headers then -1
+  else
+    let cl = content_length buf headers in
+    if Int64.(<=) cl 0L then 0
+    else
+      let body_len = Int64.to_int_exn cl in
+      let body_end = body_off + body_len in
+      if body_end <= len then 0
+      else body_end - len
+
+(* Chunked transfer encoding *)
+type chunk_status =
+  | Chunk_ok
+  | Chunk_partial
+  | Chunk_done
+  | Chunk_error
+
+type chunk = #{
+  data_off : int;
+  data_len : int;
+  next_off : int;
+}
+
+let parse_chunk buf ~off ~len =
+  let empty_chunk = #{ data_off = 0; data_len = 0; next_off = 0 } in
+  if off >= len then #(Chunk_partial, empty_chunk)
+  else begin
+    (* Parse hex size *)
+    let mutable p = off in
+    let mutable size = 0 in
+    let mutable valid = true in
+    while valid && p < len do
+      let c = peek buf p in
+      if Char.(>=) c '0' && Char.(<=) c '9' then begin
+        size <- size * 16 + (Char.to_int c - 48);
+        p <- p + 1
+      end else if Char.(>=) c 'a' && Char.(<=) c 'f' then begin
+        size <- size * 16 + (Char.to_int c - 87);
+        p <- p + 1
+      end else if Char.(>=) c 'A' && Char.(<=) c 'F' then begin
+        size <- size * 16 + (Char.to_int c - 55);
+        p <- p + 1
+      end else
+        valid <- false
+    done;
+    if p = off then #(Chunk_error, empty_chunk)
+    else begin
+      (* Skip optional chunk extension and CRLF *)
+      while p < len && peek buf p <>. '\r' do
+        p <- p + 1
+      done;
+      if p + 1 >= len then #(Chunk_partial, empty_chunk)
+      else if peek buf (p+1) <>. '\n' then #(Chunk_error, empty_chunk)
+      else begin
+        let data_off = p + 2 in
+        if size = 0 then begin
+          (* Final chunk - skip trailing CRLF *)
+          if data_off + 1 >= len then #(Chunk_partial, empty_chunk)
+          else if peek buf data_off =. '\r' && peek buf (data_off+1) =. '\n' then
+            #(Chunk_done, #{ data_off; data_len = 0; next_off = data_off + 2 })
+          else
+            #(Chunk_done, #{ data_off; data_len = 0; next_off = data_off })
+        end else begin
+          let data_end = data_off + size in
+          if data_end + 1 >= len then #(Chunk_partial, empty_chunk)
+          else if peek buf data_end <>. '\r' || peek buf (data_end+1) <>. '\n' then
+            #(Chunk_error, empty_chunk)
+          else
+            #(Chunk_ok, #{ data_off; data_len = size; next_off = data_end + 2 })
+        end
+      end
+    end
+  end
+
+(* Response types and writing *)
+type response_status =
+  | S200_OK | S201_Created | S204_No_Content
+  | S301_Moved_Permanently | S302_Found | S304_Not_Modified
+  | S400_Bad_Request | S401_Unauthorized | S403_Forbidden | S404_Not_Found
+  | S405_Method_Not_Allowed | S411_Length_Required | S413_Payload_Too_Large
+  | S500_Internal_Server_Error | S502_Bad_Gateway | S503_Service_Unavailable
+
+let response_status_code = function
+  | S200_OK -> 200
+  | S201_Created -> 201
+  | S204_No_Content -> 204
+  | S301_Moved_Permanently -> 301
+  | S302_Found -> 302
+  | S304_Not_Modified -> 304
+  | S400_Bad_Request -> 400
+  | S401_Unauthorized -> 401
+  | S403_Forbidden -> 403
+  | S404_Not_Found -> 404
+  | S405_Method_Not_Allowed -> 405
+  | S411_Length_Required -> 411
+  | S413_Payload_Too_Large -> 413
+  | S500_Internal_Server_Error -> 500
+  | S502_Bad_Gateway -> 502
+  | S503_Service_Unavailable -> 503
+
+let response_status_reason = function
+  | S200_OK -> "OK"
+  | S201_Created -> "Created"
+  | S204_No_Content -> "No Content"
+  | S301_Moved_Permanently -> "Moved Permanently"
+  | S302_Found -> "Found"
+  | S304_Not_Modified -> "Not Modified"
+  | S400_Bad_Request -> "Bad Request"
+  | S401_Unauthorized -> "Unauthorized"
+  | S403_Forbidden -> "Forbidden"
+  | S404_Not_Found -> "Not Found"
+  | S405_Method_Not_Allowed -> "Method Not Allowed"
+  | S411_Length_Required -> "Length Required"
+  | S413_Payload_Too_Large -> "Payload Too Large"
+  | S500_Internal_Server_Error -> "Internal Server Error"
+  | S502_Bad_Gateway -> "Bad Gateway"
+  | S503_Service_Unavailable -> "Service Unavailable"
+
+(* Write string to bytes at offset, return new offset *)
+let[@inline] write_string_at dst off s =
+  let len = String.length s in
+  Bytes.From_string.blit ~src:s ~src_pos:0 ~dst ~dst_pos:off ~len;
+  off + len
+
+(* Write integer to bytes at offset, return new offset *)
+let write_int_at dst off n =
+  if n = 0 then begin
+    Bytes.unsafe_set dst off '0';
+    off + 1
+  end else begin
+    (* Count digits *)
+    let mutable temp = n in
+    let mutable digits = 0 in
+    while temp > 0 do
+      digits <- digits + 1;
+      temp <- temp / 10
+    done;
+    (* Write digits right-to-left *)
+    let mutable p = off + digits - 1 in
+    let mutable remaining = n in
+    while remaining > 0 do
+      Bytes.unsafe_set dst p (Char.of_int_exn (48 + Int.rem remaining 10));
+      remaining <- remaining / 10;
+      p <- p - 1
+    done;
+    off + digits
+  end
+
+let write_status_line dst ~off status version =
+  (* HTTP/1.x *)
+  let off = write_string_at dst off (version_to_string version) in
+  Bytes.unsafe_set dst off ' ';
+  let off = off + 1 in
+  (* Status code *)
+  let off = write_int_at dst off (response_status_code status) in
+  Bytes.unsafe_set dst off ' ';
+  let off = off + 1 in
+  (* Reason phrase *)
+  let off = write_string_at dst off (response_status_reason status) in
+  (* CRLF *)
+  Bytes.unsafe_set dst off '\r';
+  Bytes.unsafe_set dst (off+1) '\n';
+  off + 2
+
+let write_header dst ~off name value =
+  let off = write_string_at dst off name in
+  Bytes.unsafe_set dst off ':';
+  Bytes.unsafe_set dst (off+1) ' ';
+  let off = off + 2 in
+  let off = write_string_at dst off value in
+  Bytes.unsafe_set dst off '\r';
+  Bytes.unsafe_set dst (off+1) '\n';
+  off + 2
+
+let write_header_int dst ~off name value =
+  let off = write_string_at dst off name in
+  Bytes.unsafe_set dst off ':';
+  Bytes.unsafe_set dst (off+1) ' ';
+  let off = off + 2 in
+  let off = write_int_at dst off value in
+  Bytes.unsafe_set dst off '\r';
+  Bytes.unsafe_set dst (off+1) '\n';
+  off + 2
+
+let write_crlf dst ~off =
+  Bytes.unsafe_set dst off '\r';
+  Bytes.unsafe_set dst (off+1) '\n';
+  off + 2
+
+let write_content_length dst ~off len =
+  write_header_int dst ~off "Content-Length" len
+
+let write_connection dst ~off keep_alive =
+  if keep_alive then write_header dst ~off "Connection" "keep-alive"
+  else write_header dst ~off "Connection" "close"

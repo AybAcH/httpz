@@ -136,6 +136,75 @@ val is_chunked : buffer -> header list @ local -> bool
 val is_keep_alive : buffer -> header list @ local -> version -> bool
 (** Check Connection keep-alive. *)
 
+(** {1 Body Handling} *)
+
+val body_in_buffer : buffer -> len:int -> body_off:int -> header list @ local -> bool
+(** Check if the complete body is available in the buffer.
+    Returns [true] if body_off + content_length <= len, or if there's no body. *)
+
+val body_span : buffer -> len:int -> body_off:int -> header list @ local -> span
+(** Get span of body if fully in buffer. Returns span with [len = -1] if body
+    incomplete or chunked encoding (use [parse_chunk] for chunked). *)
+
+val body_bytes_needed : buffer -> len:int -> body_off:int -> header list @ local -> int
+(** Returns additional bytes needed for complete body, or [0] if complete.
+    Returns [-1] for chunked encoding (unknown length). *)
+
+(** {2 Chunked Transfer Encoding} *)
+
+type chunk_status =
+  | Chunk_ok       (** Chunk parsed successfully *)
+  | Chunk_partial  (** Need more data *)
+  | Chunk_done     (** Final chunk (zero-length) *)
+  | Chunk_error    (** Malformed chunk *)
+
+type chunk = #{
+  data_off : int;  (** Offset of chunk data in buffer *)
+  data_len : int;  (** Length of chunk data *)
+  next_off : int;  (** Offset where next chunk starts *)
+}
+(** Unboxed chunk record. *)
+
+val parse_chunk : buffer -> off:int -> len:int -> #(chunk_status * chunk)
+(** Parse a single chunk starting at [off]. Buffer contains [len] bytes total.
+    Returns chunk info and status. For [Chunk_ok], use [next_off] to parse
+    the next chunk. For [Chunk_done], parsing is complete. *)
+
+(** {1 Response Writing} *)
+
+type response_status =
+  | S200_OK | S201_Created | S204_No_Content
+  | S301_Moved_Permanently | S302_Found | S304_Not_Modified
+  | S400_Bad_Request | S401_Unauthorized | S403_Forbidden | S404_Not_Found
+  | S405_Method_Not_Allowed | S411_Length_Required | S413_Payload_Too_Large
+  | S500_Internal_Server_Error | S502_Bad_Gateway | S503_Service_Unavailable
+
+val response_status_code : response_status -> int
+(** Get numeric status code. *)
+
+val response_status_reason : response_status -> string
+(** Get reason phrase. *)
+
+val write_status_line : bytes -> off:int -> response_status -> version -> int
+(** Write "HTTP/1.x CODE Reason\\r\\n" to bytes at offset.
+    Returns new offset (bytes written = new_off - off). *)
+
+val write_header : bytes -> off:int -> string -> string -> int
+(** Write "Name: Value\\r\\n" to bytes at offset. Returns new offset. *)
+
+val write_header_int : bytes -> off:int -> string -> int -> int
+(** Write header with integer value. Returns new offset. *)
+
+val write_crlf : bytes -> off:int -> int
+(** Write "\\r\\n" to bytes. Returns new offset. *)
+
+val write_content_length : bytes -> off:int -> int -> int
+(** Write "Content-Length: N\\r\\n". Returns new offset. *)
+
+val write_connection : bytes -> off:int -> bool -> int
+(** Write "Connection: keep-alive\\r\\n" or "Connection: close\\r\\n".
+    [true] for keep-alive. Returns new offset. *)
+
 (** {1 Debug} *)
 
 val status_to_string : status -> string
