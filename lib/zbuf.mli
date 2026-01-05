@@ -53,18 +53,22 @@ type pos = int
     never allocates. Access fields with [sp.#start] and [sp.#len]. *)
 type span = #{ start : pos; len : int }
 
-(** A single buffer fragment. *)
-type fragment = {
-  data : bytes;
-  off : int;
-  len : int;
-  base : pos;
-}
+(** A single buffer fragment (unboxed record).
+
+    Access fields with [frag.#data], [frag.#off], [frag.#len], [frag.#base]. *)
+type fragment = #{ data : bytes; off : int; len : int; base : pos }
+
+(** Fragment array module (abstract). *)
+module Frag_array : sig
+  type t
+  val length : t -> int
+  val get : t -> int -> fragment
+end
 
 (** Multi-buffer collection. *)
 type t = {
-  fragments : fragment Dynarray.t;  (** Resizable fragment array *)
-  mutable total_len : int;          (** Total bytes across all fragments *)
+  fragments : Frag_array.t;  (** Fragment storage *)
+  mutable total_len : int;   (** Total bytes across all fragments *)
 }
 
 (** Parsing cursor.

@@ -531,6 +531,113 @@ let test_body_drain () =
     pass "body_drain")
 
 (* ============================================================
+   Streaming Body Tests (zero-copy callback API)
+   ============================================================ *)
+
+let test_body_stream_fixed () =
+  with_string_buffer
+    "POST /api HTTP/1.1\r\nContent-Length: 13\r\n\r\nHello, World!" (fun buf ->
+    let req = parse_request buf in
+    let reader = body_reader_of_request buf req in
+    let chunks = ref [] in
+    let callback buf sp =
+      chunks := (Zbuf.span_to_string buf.zb sp) :: !chunks;
+      Continue
+    in
+    (match body_stream buf reader callback with
+     | Body_complete { trailers = None } -> ()
+     | _ -> assert false);
+    let body = String.concat "" (List.rev !chunks) in
+    assert_equal ~msg:"streamed body content" "Hello, World!" body;
+    pass "body_stream_fixed")
+
+let test_body_stream_chunked () =
+  with_string_buffer
+    ("POST /api HTTP/1.1\r\n" ^
+     "Transfer-Encoding: chunked\r\n" ^
+     "\r\n" ^
+     "5\r\n" ^
+     "hello\r\n" ^
+     "6\r\n" ^
+     " world\r\n" ^
+     "0\r\n" ^
+     "\r\n") (fun buf ->
+    let req = parse_request buf in
+    let reader = body_reader_of_request buf req in
+    let chunks = ref [] in
+    let callback buf sp =
+      chunks := (Zbuf.span_to_string buf.zb sp) :: !chunks;
+      Continue
+    in
+    (match body_stream buf reader callback with
+     | Body_complete { trailers = _ } -> ()
+     | _ -> assert false);
+    let body = String.concat "" (List.rev !chunks) in
+    assert_equal ~msg:"streamed chunked body" "hello world" body;
+    pass "body_stream_chunked")
+
+let test_body_stream_chunked_trailers () =
+  with_string_buffer
+    ("POST /api HTTP/1.1\r\n" ^
+     "Transfer-Encoding: chunked\r\n" ^
+     "\r\n" ^
+     "5\r\n" ^
+     "hello\r\n" ^
+     "0\r\n" ^
+     "X-Checksum: abc123\r\n" ^
+     "\r\n") (fun buf ->
+    let req = parse_request buf in
+    let reader = body_reader_of_request buf req in
+    let callback _buf _sp = Continue in
+    let result = body_stream buf reader callback in
+    (match body_result_trailers result with
+     | Some trailers ->
+       (match Headers.find_by_string buf.zb trailers "X-Checksum" with
+        | Some bs -> assert_equal ~msg:"trailer value" "abc123" (Zbuf.span_to_string buf.zb (unbox_span bs))
+        | None -> assert false)
+     | None -> assert false);
+    pass "body_stream_chunked_trailers")
+
+let test_body_stream_stop_early () =
+  (* Use chunked encoding to ensure multiple callbacks *)
+  with_string_buffer
+    ("POST /api HTTP/1.1\r\n" ^
+     "Transfer-Encoding: chunked\r\n" ^
+     "\r\n" ^
+     "5\r\n" ^
+     "hello\r\n" ^
+     "5\r\n" ^
+     "world\r\n" ^
+     "5\r\n" ^
+     "12345\r\n" ^
+     "0\r\n" ^
+     "\r\n") (fun buf ->
+    let req = parse_request buf in
+    let reader = body_reader_of_request buf req in
+    let count = ref 0 in
+    let callback _buf _sp =
+      incr count;
+      if !count >= 2 then Stop else Continue
+    in
+    (match body_stream buf reader callback with
+     | Body_stopped -> ()
+     | _ -> assert false);
+    assert_equal_int ~msg:"callback count" 2 !count;
+    pass "body_stream_stop_early")
+
+let test_body_stream_empty () =
+  with_string_buffer "GET / HTTP/1.1\r\n\r\n" (fun buf ->
+    let req = parse_request buf in
+    let reader = body_reader_of_request buf req in
+    let called = ref false in
+    let callback _buf _sp = called := true; Continue in
+    (match body_stream buf reader callback with
+     | Body_complete { trailers = None } -> ()
+     | _ -> assert false);
+    assert_true ~msg:"callback not called for empty body" (not !called);
+    pass "body_stream_empty")
+
+(* ============================================================
    Error Handling Tests
    ============================================================ *)
 
@@ -717,6 +824,13 @@ let () =
   test_body_incremental_read ();
   test_body_response_no_body ();
   test_body_drain ();
+
+  Printf.printf "\n--- Streaming Body Tests ---\n";
+  test_body_stream_fixed ();
+  test_body_stream_chunked ();
+  test_body_stream_chunked_trailers ();
+  test_body_stream_stop_early ();
+  test_body_stream_empty ();
 
   Printf.printf "\n--- Error Handling Tests ---\n";
   test_parse_error_invalid_method ();

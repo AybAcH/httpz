@@ -8,3 +8,14 @@
  (name zbuf)
  (public_name httpl.zbuf)
  (modules zbuf))
+
+(library
+ (name httplo)
+ (public_name httpl.httplo)
+ (modules httplo)
+ (libraries zbufo))
+
+(library
+ (name zbufo)
+ (public_name httpl.zbufo)
+ (modules zbufo))

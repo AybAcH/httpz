@@ -4,8 +4,8 @@ type span = Zbuf.span = #{ start : Zbuf.pos; len : int }
 
 type boxed_span = { bs_start : Zbuf.pos; bs_len : int }
 
-let[@inline] box_span (sp : span) : boxed_span = { bs_start = sp.#start; bs_len = sp.#len }
-let[@inline] unbox_span (bs : boxed_span) : span = #{ start = bs.bs_start; len = bs.bs_len }
+let[@inline always] box_span (sp : span) : boxed_span = { bs_start = sp.#start; bs_len = sp.#len }
+let[@inline always] unbox_span (bs : boxed_span) : span = #{ start = bs.bs_start; len = bs.bs_len }
 
 type buffer = { zb : Zbuf.t; cur : Zbuf.cursor }
 
@@ -41,14 +41,14 @@ type header_entry = {
   value_len : int;
 }
 
-let[@inline] make_header_entry ~name_span ~value =
+let[@inline always] make_header_entry ~name_span ~value =
   { name_span_start = name_span.#start; name_span_len = name_span.#len;
     value_start = value.#start; value_len = value.#len }
 
-let[@inline] header_entry_name_span e : span =
+let[@inline always] header_entry_name_span e : span =
   #{ start = e.name_span_start; len = e.name_span_len }
 
-let[@inline] header_entry_value e : span =
+let[@inline always] header_entry_value e : span =
   #{ start = e.value_start; len = e.value_len }
 
 type unknown_header = {
@@ -60,7 +60,7 @@ type unknown_header = {
 module Headers = struct
   module IntMap = Map.Make(Int)
 
-  let[@inline] key_of_name = function
+  let[@inline always] key_of_name = function
     | H_cache_control -> 0 | H_connection -> 1 | H_date -> 2
     | H_transfer_encoding -> 3 | H_upgrade -> 4 | H_via -> 5
     | H_accept -> 6 | H_accept_charset -> 7 | H_accept_encoding -> 8
@@ -87,7 +87,7 @@ module Headers = struct
 
   let empty = { known = IntMap.empty; unknown = []; count = 0 }
 
-  let[@inline] count t = t.count
+  let[@inline always] count t = t.count
 
   let add t name ~name_span ~value =
     let entry = make_header_entry ~name_span ~value in
@@ -117,7 +117,7 @@ module Headers = struct
       | Some (_, []) -> None
       | Some (_, e :: _) -> Some (box_span (header_entry_value e))
 
-  let[@inline] with_known t name ~default ~f =
+  let[@inline always] with_known t name ~default ~f =
     let key = key_of_name name in
     if key < 0 then default
     else match IntMap.find_opt key t.known with
@@ -220,7 +220,7 @@ type request = {
   headers : Headers.t;
 }
 
-let[@inline] request_target r : span = #{ start = r.target_start; len = r.target_len }
+let[@inline always] request_target r : span = #{ start = r.target_start; len = r.target_len }
 
 type response = {
   version : version;
@@ -230,7 +230,7 @@ type response = {
   headers : Headers.t;
 }
 
-let[@inline] response_reason r : span = #{ start = r.reason_start; len = r.reason_len }
+let[@inline always] response_reason r : span = #{ start = r.reason_start; len = r.reason_len }
 
 type error =
   | Partial | Invalid_method | Invalid_target | Invalid_version
@@ -253,24 +253,24 @@ let push buf data ~off ~len = Zbuf.push buf.zb data ~off ~len
 let with_refill buf refill f =
   Zbuf.with_refill buf.zb (fun _ -> refill buf) f
 
-let[@inline] mark buf = Zbuf.cursor_mark buf.cur
-let[@inline] peek buf off = Zbuf.peek buf.zb buf.cur off
-let[@inline] try_refill buf n = Zbuf.ensure buf.zb buf.cur n
-let[@inline] consume buf n = Zbuf.advance buf.cur n
+let[@inline always] mark buf = Zbuf.cursor_mark buf.cur
+let[@inline always] peek buf off = Zbuf.peek buf.zb buf.cur off
+let[@inline always] try_refill buf n = Zbuf.ensure buf.zb buf.cur n
+let[@inline always] consume buf n = Zbuf.advance buf.cur n
 
-let[@inline] is_tchar = function
+let[@inline always] is_tchar = function
   | 'a'..'z' | 'A'..'Z' | '0'..'9' -> true
   | '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' -> true
   | '^' | '_' | '`' | '|' | '~' -> true
   | _ -> false
 
-let[@inline] is_space = function ' ' | '\t' -> true | _ -> false
+let[@inline always] is_space = function ' ' | '\t' -> true | _ -> false
 
-let[@inline] span_to_string buf sp = Zbuf.span_to_string buf.zb sp
-let[@inline] span_equal buf sp s = Zbuf.span_equal buf.zb sp s
-let[@inline] span_equal_caseless buf sp s = Zbuf.span_equal_caseless buf.zb sp s
-let[@inline] span_iter f buf sp = Zbuf.span_iter f buf.zb sp
-let[@inline] span_fold f buf sp init = Zbuf.span_fold f buf.zb sp init
+let[@inline always] span_to_string buf sp = Zbuf.span_to_string buf.zb sp
+let[@inline always] span_equal buf sp s = Zbuf.span_equal buf.zb sp s
+let[@inline always] span_equal_caseless buf sp s = Zbuf.span_equal_caseless buf.zb sp s
+let[@inline always] span_iter f buf sp = Zbuf.span_iter f buf.zb sp
+let[@inline always] span_fold f buf sp init = Zbuf.span_fold f buf.zb sp init
 
 let parse_header_name buf (sp : span) : header_name =
   match sp.#len with
@@ -365,7 +365,7 @@ let take_while1 pred buf =
   if sp.#len = 0 then raise (Parse_error Partial);
   sp
 
-let[@inline] skip_ows buf = ignore (Zbuf.scan_while is_space buf.zb buf.cur)
+let[@inline always] skip_ows buf = ignore (Zbuf.scan_while is_space buf.zb buf.cur)
 
 let expect_crlf buf =
   if peek buf 0 = '\r' && peek buf 1 = '\n' then consume buf 2
@@ -529,11 +529,11 @@ let content_length (buf : buffer) (req : request) =
   Option.bind (Headers.find_known req.headers H_content_length)
     (fun bs -> Int64.of_string_opt (boxed_span_to_string buf bs))
 
-let[@inline] is_chunked (buf : buffer) (req : request) =
+let[@inline always] is_chunked (buf : buffer) (req : request) =
   Headers.with_known req.headers H_transfer_encoding ~default:false
     ~f:(fun sp -> Zbuf.span_equal_caseless buf.zb sp "chunked")
 
-let[@inline] is_keep_alive (buf : buffer) (req : request) =
+let[@inline always] is_keep_alive (buf : buffer) (req : request) =
   Headers.with_known req.headers H_connection ~default:(req.version = HTTP_1_1)
     ~f:(fun sp ->
       if Zbuf.span_equal_caseless buf.zb sp "close" then false
@@ -551,7 +551,7 @@ let content_length_resp (buf : buffer) (resp : response) =
   Option.bind (Headers.find_known resp.headers H_content_length)
     (fun bs -> Int64.of_string_opt (boxed_span_to_string buf bs))
 
-let[@inline] is_chunked_resp (buf : buffer) (resp : response) =
+let[@inline always] is_chunked_resp (buf : buffer) (resp : response) =
   Headers.with_known resp.headers H_transfer_encoding ~default:false
     ~f:(fun sp -> Zbuf.span_equal_caseless buf.zb sp "chunked")
 
@@ -564,12 +564,12 @@ let write_out dst ~pos = function
   | Str s -> Bytes.blit_string s 0 dst pos (String.length s); String.length s
   | Span (buf, sp) -> Zbuf.span_blit buf.zb sp dst ~dst_off:pos; sp.#len
 
-let[@inline] write_crlf dst ~pos =
+let[@inline always] write_crlf dst ~pos =
   Bytes.set dst pos '\r'; Bytes.set dst (pos + 1) '\n'; 2
 
-let[@inline] write_sp dst ~pos = Bytes.set dst pos ' '; 1
+let[@inline always] write_sp dst ~pos = Bytes.set dst pos ' '; 1
 
-let[@inline] write_colon_sp dst ~pos =
+let[@inline always] write_colon_sp dst ~pos =
   Bytes.set dst pos ':'; Bytes.set dst (pos + 1) ' '; 2
 
 let write_method dst ~pos = function
@@ -588,11 +588,11 @@ let write_method_from ~src dst ~pos = function
   | Other sp -> Zbuf.span_blit src.zb sp dst ~dst_off:pos; sp.#len
   | m -> write_method dst ~pos m
 
-let[@inline] write_version dst ~pos = function
+let[@inline always] write_version dst ~pos = function
   | HTTP_1_0 -> Bytes.blit_string "HTTP/1.0" 0 dst pos 8; 8
   | HTTP_1_1 -> Bytes.blit_string "HTTP/1.1" 0 dst pos 8; 8
 
-let[@inline] write_status_code dst ~pos status =
+let[@inline always] write_status_code dst ~pos status =
   Bytes.set dst pos (Char.chr (48 + status / 100));
   Bytes.set dst (pos + 1) (Char.chr (48 + (status / 10) mod 10));
   Bytes.set dst (pos + 2) (Char.chr (48 + status mod 10));
@@ -682,6 +682,15 @@ type body_reader =
   | Chunked_body of { mutable chunk_remaining : int64; mutable done_ : bool; mutable trailers : Headers.t option }
   | Close_body
   | Empty_body
+
+type body_action = Continue | Stop
+
+type body_result =
+  | Body_complete of { trailers : Headers.t option }
+  | Body_stopped
+  | Body_eof
+
+type body_chunk_callback = buffer -> span -> body_action
 
 let body_reader_of_transfer = function
   | Fixed len -> Fixed_body { remaining = len }
@@ -809,7 +818,7 @@ let body_drain buf reader =
     if body_read buf reader chunk ~off:0 ~len:4096 = 0 then draining <- false
   done
 
-let[@inline] body_is_done reader =
+let[@inline always] body_is_done reader =
   match reader with
   | Empty_body -> true
   | Fixed_body state -> state.remaining = 0L
@@ -819,4 +828,77 @@ let[@inline] body_is_done reader =
 let body_trailers reader =
   match reader with
   | Chunked_body { done_ = true; trailers = Some t; _ } -> Some t
+  | _ -> None
+
+(* Zero-copy streaming body API *)
+
+let rec body_stream buf reader callback =
+  match reader with
+  | Empty_body ->
+    Body_complete { trailers = None }
+  | Fixed_body state ->
+    if state.remaining = 0L then
+      Body_complete { trailers = None }
+    else begin
+      let available = Zbuf.cursor_remaining buf.zb buf.cur in
+      if available = 0 then begin
+        if try_refill buf 1 then body_stream buf reader callback
+        else Body_eof
+      end else begin
+        let want = Int64.to_int (min state.remaining (Int64.of_int available)) in
+        let sp = #{ start = Zbuf.cursor_pos buf.cur; len = want } in
+        consume buf want;
+        state.remaining <- Int64.sub state.remaining (Int64.of_int want);
+        match callback buf sp with
+        | Continue -> body_stream buf reader callback
+        | Stop -> Body_stopped
+      end
+    end
+  | Close_body ->
+    let available = Zbuf.cursor_remaining buf.zb buf.cur in
+    if available = 0 then begin
+      if try_refill buf 1 then body_stream buf reader callback
+      else Body_complete { trailers = None }
+    end else begin
+      let sp = #{ start = Zbuf.cursor_pos buf.cur; len = available } in
+      consume buf available;
+      match callback buf sp with
+      | Continue -> body_stream buf reader callback
+      | Stop -> Body_stopped
+    end
+  | Chunked_body state ->
+    if state.done_ then
+      Body_complete { trailers = state.trailers }
+    else if state.chunk_remaining = 0L then begin
+      let size = parse_chunk_size buf in
+      if size = 0L then begin
+        state.done_ <- true;
+        state.trailers <- Some (parse_headers buf);
+        Body_complete { trailers = state.trailers }
+      end else begin
+        state.chunk_remaining <- size;
+        body_stream buf reader callback
+      end
+    end else begin
+      let available = Zbuf.cursor_remaining buf.zb buf.cur in
+      if available = 0 then begin
+        if try_refill buf 1 then body_stream buf reader callback
+        else Body_eof
+      end else begin
+        let want = Int64.to_int (min state.chunk_remaining (Int64.of_int available)) in
+        let sp = #{ start = Zbuf.cursor_pos buf.cur; len = want } in
+        consume buf want;
+        state.chunk_remaining <- Int64.sub state.chunk_remaining (Int64.of_int want);
+        if state.chunk_remaining = 0L then begin
+          if try_refill buf 2 && peek buf 0 = '\r' && peek buf 1 = '\n' then
+            consume buf 2
+        end;
+        match callback buf sp with
+        | Continue -> body_stream buf reader callback
+        | Stop -> Body_stopped
+      end
+    end
+
+let body_result_trailers = function
+  | Body_complete { trailers } -> trailers
   | _ -> None
