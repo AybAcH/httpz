@@ -1,41 +1,20 @@
-(* zbuf.ml - Zero-copy multi-buffer spans with OxCaml optimizations
-
-   Key optimizations:
-   - Unboxed span type: no heap allocation for token boundaries
-   - Local cursor allocation: stack-allocated parsing state
-   - let mutable: no ref allocation in hot loops
-   - Simplified effect: enables local cursors in effect handlers *)
+(* zbuf.ml - Zero-copy multi-buffer spans with OxCaml optimizations *)
 
 type pos = int
 
-(* Unboxed span - passed by value, no heap allocation *)
 type span = #{ start : pos; len : int }
 
-type fragment = {
-  data : bytes;
-  off : int;
-  len : int;
-  base : pos;
-}
+type fragment = { data : bytes; off : int; len : int; base : pos }
 
-type t = {
-  fragments : fragment Dynarray.t;
-  mutable total_len : int;
-}
+type t = { fragments : fragment Dynarray.t; mutable total_len : int }
 
-type cursor = {
-  mutable pos : pos;
-  mutable mark : pos;
-  mutable frag_idx : int;
-}
+type cursor = { mutable pos : pos; mutable mark : pos; mutable frag_idx : int }
 
-(* Simplified effect - no payload enables local cursors *)
 type _ Effect.t += Need_data : bool Effect.t
 
 type refill = t -> bool
 
-let create () =
-  { fragments = Dynarray.create (); total_len = 0 }
+let create () = { fragments = Dynarray.create (); total_len = 0 }
 
 let push t data ~off ~len =
   if off < 0 || len < 0 || off + len > Bytes.length data then
@@ -44,11 +23,10 @@ let push t data ~off ~len =
   Dynarray.add_last t.fragments frag;
   if len > 0 then t.total_len <- t.total_len + len
 
-let length t = t.total_len
-let limit t = t.total_len
-let fragment_count t = Dynarray.length t.fragments
+let[@inline] length t = t.total_len
+let[@inline] limit t = t.total_len
+let[@inline] fragment_count t = Dynarray.length t.fragments
 
-(* Find fragment index containing position *)
 let find_frag_idx_from t pos start_idx =
   let count = Dynarray.length t.fragments in
   if count = 0 then 0
@@ -63,21 +41,17 @@ let find_frag_idx_from t pos start_idx =
     if found then idx else count - 1
   end
 
-(* Stack-allocated cursor creation *)
 let cursor t ~pos = exclave_
   if pos < 0 || pos > t.total_len then
     invalid_arg "Zbuf.cursor: position out of bounds";
-  let frag_idx = find_frag_idx_from t pos 0 in
-  stack_ { pos; mark = pos; frag_idx }
+  stack_ { pos; mark = pos; frag_idx = find_frag_idx_from t pos 0 }
 
-(* Heap-allocated cursor for storage *)
 let cursor_global t ~pos =
   if pos < 0 || pos > t.total_len then
     invalid_arg "Zbuf.cursor_global: position out of bounds";
-  let frag_idx = find_frag_idx_from t pos 0 in
-  { pos; mark = pos; frag_idx }
+  { pos; mark = pos; frag_idx = find_frag_idx_from t pos 0 }
 
-let cursor_pos cur = cur.pos
+let[@inline] cursor_pos cur = cur.pos
 
 let cursor_set t cur new_pos =
   if new_pos < 0 || new_pos > t.total_len then
@@ -88,28 +62,22 @@ let cursor_set t cur new_pos =
     let frag = Dynarray.get t.fragments cur.frag_idx in
     if new_pos < frag.base then cur.frag_idx <- 0
   end;
-  (* Advance frag_idx to contain new_pos *)
   let mutable done_ = false in
   while not done_ do
     if cur.frag_idx >= count - 1 then done_ <- true
     else begin
       let frag = Dynarray.get t.fragments cur.frag_idx in
-      if new_pos >= frag.base + frag.len then
-        cur.frag_idx <- cur.frag_idx + 1
-      else
-        done_ <- true
+      if new_pos >= frag.base + frag.len then cur.frag_idx <- cur.frag_idx + 1
+      else done_ <- true
     end
   done
 
-let cursor_mark cur = cur.mark <- cur.pos
-let cursor_marked cur = cur.mark
-let cursor_remaining t cur = t.total_len - cur.pos
+let[@inline] cursor_mark cur = cur.mark <- cur.pos
+let[@inline] cursor_marked cur = cur.mark
+let[@inline] cursor_remaining t cur = t.total_len - cur.pos
 
-(* Request more data via effect *)
-let[@inline] request_data () =
-  Effect.perform Need_data
+let[@inline] request_data () = Effect.perform Need_data
 
-(* Effect handler for Need_data. *)
 let with_refill (type a) zb (refill : refill) (f : unit -> a) : a =
   let do_refill () : bool = refill zb in
   let effc : type b. b Effect.t -> ((b, a) Effect.Deep.continuation -> a) option =
@@ -117,18 +85,14 @@ let with_refill (type a) zb (refill : refill) (f : unit -> a) : a =
     | Need_data -> Some (fun k -> Effect.Deep.continue k (do_refill () : b))
     | _ -> None
   in
-  Effect.Deep.match_with f ()
-    { retc = Fun.id; exnc = raise; effc }
+  Effect.Deep.match_with f () { retc = Fun.id; exnc = raise; effc }
 
-(* Peek at offset from cursor position - auto-refills via effects *)
 let rec peek t cur off =
   let pos = cur.pos + off in
   if pos < 0 then invalid_arg "Zbuf.peek: negative position";
   if pos >= t.total_len then begin
-    if request_data () then
-      peek t cur off
-    else
-      raise End_of_file
+    if request_data () then peek t cur off
+    else raise End_of_file
   end else begin
     let count = Dynarray.length t.fragments in
     if cur.frag_idx < count then begin
@@ -136,7 +100,6 @@ let rec peek t cur off =
       if pos >= frag.base && pos < frag.base + frag.len then
         Bytes.unsafe_get frag.data (frag.off + pos - frag.base)
       else begin
-        (* Scan forward from current *)
         let mutable idx = cur.frag_idx + 1 in
         let mutable result = '\x00' in
         let mutable found = false in
@@ -145,19 +108,15 @@ let rec peek t cur off =
           if pos < f.base + f.len then begin
             result <- Bytes.unsafe_get f.data (f.off + pos - f.base);
             found <- true
-          end else
-            idx <- idx + 1
+          end else idx <- idx + 1
         done;
         result
       end
-    end else
-      invalid_arg "Zbuf.peek: inconsistent state"
+    end else invalid_arg "Zbuf.peek: inconsistent state"
   end
 
-let[@inline always] advance cur n =
-  cur.pos <- cur.pos + n
+let[@inline always] advance cur n = cur.pos <- cur.pos + n
 
-(* Scan while predicate holds, using effects to refill when needed *)
 let scan_while pred t cur =
   let start_pos = cur.pos in
   let mutable scanning = true in
@@ -168,61 +127,46 @@ let scan_while pred t cur =
     end else begin
       let frag = Dynarray.get t.fragments cur.frag_idx in
       let frag_end = frag.base + frag.len in
-      if cur.pos >= frag_end then begin
-        cur.frag_idx <- cur.frag_idx + 1
-      end else begin
-        (* Scan within current fragment using let mutable *)
+      if cur.pos >= frag_end then cur.frag_idx <- cur.frag_idx + 1
+      else begin
         let pos_in_frag = cur.pos - frag.base in
         let frag_remaining = frag.len - pos_in_frag in
         let mutable i = 0 in
         let mutable matched = true in
         while matched && i < frag_remaining do
           let c = Bytes.unsafe_get frag.data (frag.off + pos_in_frag + i) in
-          if pred c then i <- i + 1
-          else matched <- false
+          if pred c then i <- i + 1 else matched <- false
         done;
         cur.pos <- cur.pos + i;
         if i = frag_remaining then begin
           cur.frag_idx <- cur.frag_idx + 1;
-          if cur.frag_idx >= count then begin
+          if cur.frag_idx >= count then
             if not (request_data ()) then scanning <- false
-          end
-        end else
-          scanning <- false
+        end else scanning <- false
       end
     end
   done;
   cur.pos - start_pos
 
-(* Ensure at least n bytes are available *)
 let ensure t cur n =
   let mutable filling = true in
   let mutable result = false in
   while filling do
     let available = t.total_len - cur.pos in
-    if available >= n then begin
-      result <- true;
-      filling <- false
-    end else if request_data () then
-      ()  (* continue loop *)
-    else begin
-      result <- available > 0;
-      filling <- false
-    end
+    if available >= n then begin result <- true; filling <- false end
+    else if request_data () then ()
+    else begin result <- available > 0; filling <- false end
   done;
   result
 
-(* Take n bytes, return span from mark - no allocation (unboxed) *)
-let take cur n =
+let[@inline] take cur n =
   let sp = #{ start = cur.mark; len = cur.pos + n - cur.mark } in
   cur.pos <- cur.pos + n;
   cur.mark <- cur.pos;
   sp
 
-(* Direct position access *)
 let get t pos =
-  if pos < 0 || pos >= t.total_len then
-    invalid_arg "Zbuf.get: position out of bounds";
+  if pos < 0 || pos >= t.total_len then invalid_arg "Zbuf.get: position out of bounds";
   let mutable idx = 0 in
   let mutable result = '\x00' in
   let mutable found = false in
@@ -231,29 +175,24 @@ let get t pos =
     if pos < frag.base + frag.len then begin
       result <- Bytes.unsafe_get frag.data (frag.off + pos - frag.base);
       found <- true
-    end else
-      idx <- idx + 1
+    end else idx <- idx + 1
   done;
   result
 
-(* Span construction - all return unboxed spans, no allocation *)
-let span ~start ~len = #{ start; len }
-let span_since_mark cur = #{ start = cur.mark; len = cur.pos - cur.mark }
-let span_empty pos = #{ start = pos; len = 0 }
-let span_len (sp : span) = sp.#len
+let[@inline] span ~start ~len = #{ start; len }
+let[@inline] span_since_mark cur = #{ start = cur.mark; len = cur.pos - cur.mark }
+let[@inline] span_empty pos = #{ start = pos; len = 0 }
+let[@inline] span_len (sp : span) = sp.#len
 
-(* Find fragment index containing position *)
 let find_frag_idx t pos =
   let mutable idx = 0 in
   let mutable found = false in
   while not found do
     let frag = Dynarray.get t.fragments idx in
-    if pos < frag.base + frag.len then found <- true
-    else idx <- idx + 1
+    if pos < frag.base + frag.len then found <- true else idx <- idx + 1
   done;
   idx
 
-(* Span operations - iterate through fragments *)
 let span_to_string t (sp : span) =
   if sp.#len = 0 then ""
   else begin
@@ -283,8 +222,7 @@ let span_equal_with ~char_equal ~err_msg t (sp : span) s =
   if sp.#len <> String.length s then false
   else if sp.#len = 0 then true
   else begin
-    if sp.#start < 0 || sp.#start + sp.#len > t.total_len then
-      invalid_arg err_msg;
+    if sp.#start < 0 || sp.#start + sp.#len > t.total_len then invalid_arg err_msg;
     let start_idx = find_frag_idx t sp.#start in
     let mutable str_off = 0 in
     let mutable idx = start_idx in
@@ -300,8 +238,7 @@ let span_equal_with ~char_equal ~err_msg t (sp : span) s =
       while equal && i < to_check do
         let c1 = Bytes.unsafe_get frag.data (frag.off + pos_in_frag + i) in
         let c2 = String.unsafe_get s (str_off + i) in
-        if not (char_equal c1 c2) then equal <- false
-        else i <- i + 1
+        if not (char_equal c1 c2) then equal <- false else i <- i + 1
       done;
       str_off <- str_off + to_check;
       idx <- idx + 1;
@@ -312,8 +249,7 @@ let span_equal_with ~char_equal ~err_msg t (sp : span) s =
   end
 
 let span_equal t sp s =
-  span_equal_with ~char_equal:Char.equal
-    ~err_msg:"Zbuf.span_equal: span out of bounds" t sp s
+  span_equal_with ~char_equal:Char.equal ~err_msg:"Zbuf.span_equal: span out of bounds" t sp s
 
 let span_equal_caseless t sp s =
   span_equal_with

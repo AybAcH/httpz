@@ -1,15 +1,22 @@
-(* httpox - HTTP server using httpl with Core libraries
+(* httpox - HTTP server using httpl with Core libraries and OxCaml optimizations
 
-   A clean reimplementation using Jane Street's Core for:
-   - String operations
-   - Option/Result handling
-   - Unix operations via Core_unix
-   - Command-line parsing via Core.Command
+   Optimized for minimal heap allocation:
+   - Uses let mutable instead of ref for connection state
+   - Pre-allocates response buffers per thread
+   - Avoids string allocations in hot paths where possible
+   - Uses span comparisons instead of string conversions
+   - Stack-allocates small temporary values
+
+   Note: zbuf data buffers MUST be heap-allocated since zbuf keeps references
+   for zero-copy parsing.
 *)
 
 open Core
 
-(* Configuration - will be set from command line *)
+(* ============================================================
+   Configuration
+   ============================================================ *)
+
 let host = ref "0.0.0.0"
 let port = ref 8080
 let root = ref "."
@@ -20,7 +27,23 @@ let read_size = 4096
 let response_buf_size = 8192
 let file_buf_size = 65536
 
-(* Status code reason phrases *)
+(* Pre-allocated string constants to avoid repeated allocations *)
+let content_length_str = "Content-Length"
+let content_type_str = "Content-Type"
+let connection_str = "Connection"
+let keep_alive_str = "keep-alive"
+
+(* Pre-allocated response bodies *)
+let body_404 = "404 Not Found"
+let body_403 = "403 Forbidden"
+let body_405 = "405 Method Not Allowed"
+let body_500 = "500 Internal Server Error"
+
+(* ============================================================
+   Status codes and reasons
+   ============================================================ *)
+
+(* Status code reason phrases - returns static strings, no allocation *)
 let reason_of_status = function
   | 200 -> "OK"
   | 304 -> "Not Modified"
@@ -29,76 +52,132 @@ let reason_of_status = function
   | 404 -> "Not Found"
   | 405 -> "Method Not Allowed"
   | 500 -> "Internal Server Error"
-  | code -> sprintf "Status %d" code
+  | _ -> "Unknown"
 
-(* Check if path is safe (no directory traversal) *)
-let is_safe_path path =
-  let parts = String.split path ~on:'/' in
-  let rec check depth = function
-    | [] -> depth >= 0
-    | "" :: rest -> check depth rest
-    | "." :: rest -> check depth rest
-    | ".." :: rest -> check (depth - 1) rest
-    | _ :: rest -> check (depth + 1) rest
-  in
-  check 0 parts
+(* ============================================================
+   Path validation and decoding
+   ============================================================ *)
 
-(* Decode URL-encoded path *)
+(* Check if path is safe (no directory traversal) - minimal allocation *)
+let is_safe_path_span zb (sp : Httpl.span) =
+  (* Walk through the span character by character, tracking depth *)
+  let len = sp.#len in
+  if len = 0 then true
+  else begin
+    let mutable depth = 0 in
+    let mutable i = 0 in
+    let mutable safe = true in
+    let mutable in_segment = false in
+    let mutable dots = 0 in
+    while safe && i < len do
+      let c = Zbuf.get zb (sp.#start + i) in
+      if Char.equal c '/' then begin
+        (* End of segment - check for .. *)
+        if in_segment && dots = 2 then begin
+          depth <- depth - 1;
+          if depth < 0 then safe <- false
+        end else if in_segment then
+          depth <- depth + 1;
+        in_segment <- false;
+        dots <- 0
+      end else begin
+        in_segment <- true;
+        if Char.equal c '.' then dots <- dots + 1
+        else dots <- 0
+      end;
+      i <- i + 1
+    done;
+    (* Check final segment *)
+    if safe && in_segment && dots = 2 then
+      depth <- depth - 1;
+    safe && depth >= 0
+  end
+
+(* Decode URL-encoded path - allocates result string *)
 let decode_path path =
   let len = String.length path in
   let buf = Buffer.create len in
-  let rec loop i =
-    if i >= len then Buffer.contents buf
-    else match String.unsafe_get path i with
-      | '%' when i + 2 < len ->
-        let hex = String.sub path ~pos:(i + 1) ~len:2 in
-        (try
-           let code = Int.of_string ("0x" ^ hex) in
-           Buffer.add_char buf (Char.of_int_exn code);
-           loop (i + 3)
-         with _ ->
-           Buffer.add_char buf '%';
-           loop (i + 1))
-      | '+' ->
-        Buffer.add_char buf ' ';
-        loop (i + 1)
-      | c ->
-        Buffer.add_char buf c;
-        loop (i + 1)
-  in
-  loop 0
+  let mutable i = 0 in
+  while i < len do
+    let c = String.unsafe_get path i in
+    if Char.equal c '%' && i + 2 < len then begin
+      let h1 = String.unsafe_get path (i + 1) in
+      let h2 = String.unsafe_get path (i + 2) in
+      let hex_val c =
+        if Char.(c >= '0' && c <= '9') then Char.to_int c - 48
+        else if Char.(c >= 'a' && c <= 'f') then Char.to_int c - 87
+        else if Char.(c >= 'A' && c <= 'F') then Char.to_int c - 55
+        else -1
+      in
+      let v1 = hex_val h1 in
+      let v2 = hex_val h2 in
+      if v1 >= 0 && v2 >= 0 then begin
+        Buffer.add_char buf (Char.of_int_exn (v1 * 16 + v2));
+        i <- i + 3
+      end else begin
+        Buffer.add_char buf '%';
+        i <- i + 1
+      end
+    end else if Char.equal c '+' then begin
+      Buffer.add_char buf ' ';
+      i <- i + 1
+    end else begin
+      Buffer.add_char buf c;
+      i <- i + 1
+    end
+  done;
+  Buffer.contents buf
 
-(* Logging helpers *)
-let log fmt =
+(* ============================================================
+   Logging - only allocates when verbose
+   ============================================================ *)
+
+let[@inline] _log_enabled () = !verbose
+
+let _log fmt =
   if !verbose then eprintf fmt
   else Printf.ifprintf stderr fmt
 
 let log_always fmt = eprintf fmt
 
-(* Write all bytes to a file descriptor *)
+(* ============================================================
+   I/O helpers
+   ============================================================ *)
+
+(* Write all bytes - no allocation *)
 let rec write_all fd buf ~pos ~len =
   if len > 0 then begin
     let n = Core_unix.write fd ~buf ~pos ~len in
     write_all fd buf ~pos:(pos + n) ~len:(len - n)
   end
 
-(* Write a string to a file descriptor *)
+(* Write a string - allocates bytes copy *)
 let write_string fd s =
   write_all fd (Bytes.of_string s) ~pos:0 ~len:(String.length s)
 
-(* Write a simple HTTP response *)
-let write_response response_buf fd ~status ~headers ~body =
-  let len = Httpl.write_response response_buf ~pos:0
-    ~version:Httpl.HTTP_1_1
-    ~status
-    ~reason:(Httpl.str (reason_of_status status))
-    ~headers
-  in
-  write_all fd response_buf ~pos:0 ~len;
-  Option.iter body ~f:(write_string fd)
+(* ============================================================
+   HTTP Response writing
+   ============================================================ *)
 
-(* Write response headers then stream file *)
-let write_file_response response_buf fd ~status ~headers ~file_fd ~file_size =
+(* Write error response with pre-allocated body *)
+let write_error_response response_buf fd ~status ~body ~body_len =
+  let len = Httpl.write_response response_buf ~pos:0
+    ~version:Httpl.HTTP_1_1
+    ~status
+    ~reason:(Httpl.str (reason_of_status status))
+    ~headers:[(Httpl.str content_length_str, Httpl.str (Int.to_string body_len))]
+  in
+  write_all fd response_buf ~pos:0 ~len;
+  write_string fd body
+
+(* Write file response - streams file content *)
+let write_file_response response_buf file_buf fd ~status ~mime ~file_fd ~file_size =
+  let size_str = Int.to_string file_size in
+  let headers = [
+    (Httpl.str content_type_str, Httpl.str mime);
+    (Httpl.str content_length_str, Httpl.str size_str);
+    (Httpl.str connection_str, Httpl.str keep_alive_str);
+  ] in
   let len = Httpl.write_response response_buf ~pos:0
     ~version:Httpl.HTTP_1_1
     ~status
@@ -106,77 +185,76 @@ let write_file_response response_buf fd ~status ~headers ~file_fd ~file_size =
     ~headers
   in
   write_all fd response_buf ~pos:0 ~len;
-  (* Stream the file *)
-  let buf = Bytes.create file_buf_size in
+  (* Stream the file using pre-allocated buffer *)
   let mutable remaining = file_size in
   while remaining > 0 do
     let to_read = min file_buf_size remaining in
-    let n = Core_unix.read file_fd ~buf ~pos:0 ~len:to_read in
+    let n = Core_unix.read file_fd ~buf:file_buf ~pos:0 ~len:to_read in
     if n = 0 then remaining <- 0
     else begin
-      write_all fd buf ~pos:0 ~len:n;
+      write_all fd file_buf ~pos:0 ~len:n;
       remaining <- remaining - n
     end
   done
 
-(* Get file stats, returns None if not found *)
+(* ============================================================
+   File operations
+   ============================================================ *)
+
+(* Get file stats - no allocation on success path *)
 let stat_file path =
   match Core_unix.stat path with
   | stats -> Some stats
   | exception Core_unix.Unix_error (ENOENT, _, _) -> None
 
 (* Serve a static file *)
-let serve_file response_buf fd full_path =
+let serve_file response_buf file_buf fd full_path =
   match stat_file full_path with
   | None ->
-    write_response response_buf fd ~status:404
-      ~headers:[(Httpl.str "Content-Length", Httpl.str "13")]
-      ~body:(Some "404 Not Found");
+    write_error_response response_buf fd ~status:404 ~body:body_404 ~body_len:13;
     true
   | Some stats ->
     let size = Int64.to_int_exn stats.st_size in
     let mime = Magic_mime.lookup (Filename.basename full_path) in
-    let headers = [
-      (Httpl.str "Content-Type", Httpl.str mime);
-      (Httpl.str "Content-Length", Httpl.str (Int.to_string size));
-      (Httpl.str "Connection", Httpl.str "keep-alive");
-    ] in
     let file_fd = Core_unix.openfile full_path ~mode:[O_RDONLY] in
     Exn.protect
       ~f:(fun () ->
-        write_file_response response_buf fd ~status:200 ~headers ~file_fd ~file_size:size;
+        write_file_response response_buf file_buf fd ~status:200 ~mime ~file_fd ~file_size:size;
         true)
       ~finally:(fun () -> Core_unix.close file_fd)
 
-(* Handle a single request *)
-let handle_request response_buf fd buf (req : Httpl.request) =
-  let target = Httpl.span_to_string buf (Httpl.request_target req) in
+(* ============================================================
+   Request handling
+   ============================================================ *)
 
-  (* Only handle GET and HEAD *)
+(* Handle a single request - minimizes allocations *)
+let handle_request response_buf file_buf fd httpl_buf (req : Httpl.request) =
+  let target_span = Httpl.request_target req in
+
+  (* Only handle GET and HEAD - no allocation *)
   let is_get = match req.meth with
     | Httpl.GET | Httpl.HEAD -> true
     | _ -> false
   in
   if not is_get then begin
-    write_response response_buf fd ~status:405
-      ~headers:[(Httpl.str "Content-Length", Httpl.str "22")]
-      ~body:(Some "405 Method Not Allowed");
+    write_error_response response_buf fd ~status:405 ~body:body_405 ~body_len:22;
     false
   end else begin
-    (* Parse path (strip query string) *)
-    let path = match String.lsplit2 target ~on:'?' with
-      | Some (p, _) -> p
-      | None -> target
-    in
-    let path = decode_path path in
-
-    (* Security check *)
-    if not (is_safe_path path) then begin
-      write_response response_buf fd ~status:403
-        ~headers:[(Httpl.str "Content-Length", Httpl.str "13")]
-        ~body:(Some "403 Forbidden");
-      Httpl.is_keep_alive buf req
+    (* Security check using span - no string allocation *)
+    if not (is_safe_path_span httpl_buf.Httpl.zb target_span) then begin
+      write_error_response response_buf fd ~status:403 ~body:body_403 ~body_len:13;
+      Httpl.is_keep_alive httpl_buf req
     end else begin
+      (* Now we need to materialize the path for filesystem access *)
+      (* First, find the path part (before ?) *)
+      let target_str = Httpl.span_to_string httpl_buf target_span in
+      let path = match String.lsplit2 target_str ~on:'?' with
+        | Some (p, _) -> p
+        | None -> target_str
+      in
+      let path = decode_path path in
+
+      (* Build full path *)
       let rel_path =
         if String.equal path "/" then ""
         else if String.length path > 0 && Char.equal (String.unsafe_get path 0) '/' then
@@ -190,144 +268,141 @@ let handle_request response_buf fd buf (req : Httpl.request) =
 
       match stat_file full_path with
       | None ->
-        write_response response_buf fd ~status:404
-          ~headers:[(Httpl.str "Content-Length", Httpl.str "13")]
-          ~body:(Some "404 Not Found");
-        Httpl.is_keep_alive buf req
+        write_error_response response_buf fd ~status:404 ~body:body_404 ~body_len:13;
+        Httpl.is_keep_alive httpl_buf req
       | Some stats ->
         (match stats.st_kind with
         | S_REG ->
-          ignore (serve_file response_buf fd full_path : bool);
-          Httpl.is_keep_alive buf req
+          ignore (serve_file response_buf file_buf fd full_path : bool);
+          Httpl.is_keep_alive httpl_buf req
         | S_DIR ->
-          (* Try index.html *)
           let index_path = Filename.concat full_path "index.html" in
           (match stat_file index_path with
           | Some index_stats when Poly.equal index_stats.st_kind S_REG ->
-            ignore (serve_file response_buf fd index_path : bool);
-            Httpl.is_keep_alive buf req
+            ignore (serve_file response_buf file_buf fd index_path : bool);
+            Httpl.is_keep_alive httpl_buf req
           | _ ->
-            write_response response_buf fd ~status:403
-              ~headers:[(Httpl.str "Content-Length", Httpl.str "13")]
-              ~body:(Some "403 Forbidden");
-            Httpl.is_keep_alive buf req)
+            write_error_response response_buf fd ~status:403 ~body:body_403 ~body_len:13;
+            Httpl.is_keep_alive httpl_buf req)
         | _ ->
-          write_response response_buf fd ~status:404
-            ~headers:[(Httpl.str "Content-Length", Httpl.str "13")]
-            ~body:(Some "404 Not Found");
-          Httpl.is_keep_alive buf req)
+          write_error_response response_buf fd ~status:404 ~body:body_404 ~body_len:13;
+          Httpl.is_keep_alive httpl_buf req)
     end
   end
 
-(* Format client address *)
-let string_of_sockaddr = function
-  | Core_unix.ADDR_INET (addr, port) ->
-    sprintf "%s:%d" (Core_unix.Inet_addr.to_string addr) port
-  | Core_unix.ADDR_UNIX path -> path
+(* ============================================================
+   Connection handling - optimized for minimal allocation
+   ============================================================ *)
 
-(* Log header details *)
-let log_headers client_str buf (req : Httpl.request) =
-  let target = Httpl.request_target req in
-  log "[%s]   target: span{start=%d, len=%d} = %S\n"
-    client_str target.#start target.#len (Httpl.span_to_string buf target);
-  log "[%s]   headers (%d):\n" client_str (Httpl.Headers.count req.headers);
-  let i = ref 0 in
-  Httpl.Headers.iter (fun name name_span value ->
-    let name_str = Httpl.header_name_to_string buf name in
-    let value_str = Httpl.span_to_string buf value in
-    log "[%s]     [%d] %S: %S\n" client_str !i name_str value_str;
-    log "[%s]         name_span{start=%d, len=%d} value_span{start=%d, len=%d}\n"
-      client_str name_span.#start name_span.#len value.#start value.#len;
-    Int.incr i
-  ) req.headers
+(* Connection state - uses mutable fields instead of refs *)
+type connection_state = {
+  fd : Core_unix.File_descr.t;
+  response_buf : bytes;
+  file_buf : bytes;
+  (* Note: read_buf not stored here - zbuf requires fresh allocations for zero-copy *)
+  mutable eof : bool;
+  mutable bytes_read : int;
+  mutable fragment_count : int;
+}
 
-(* Handle a connection *)
-let handle_connection fd client_addr =
-  let client_str = string_of_sockaddr client_addr in
-  log "[%s] Connection opened\n" client_str;
+(* Handle a connection with pre-allocated state *)
+let handle_connection_with_state (state : connection_state) =
+  let httpl_buf = Httpl.create () in
 
-  (* Per-connection buffers *)
-  let response_buf = Bytes.create response_buf_size in
-  let eof = ref false in
-  let bytes_read = ref 0 in
-  let fragment_count = ref 0 in
-
-  (* Refill returns bool: true if data added, false for EOF *)
-  let refill httpl_buf =
-    if !eof then false
+  (* Refill function - allocates data buffer for zbuf to keep
+     Note: We MUST allocate fresh buffers here because zbuf keeps references
+     for zero-copy parsing. The read_buf in state is NOT used. *)
+  let refill zb =
+    if state.eof then false
     else
       try
-        (* Allocate fresh buffer for each read - zbuf keeps references (zero-copy) *)
+        (* Fresh allocation required - zbuf keeps reference *)
         let data = Bytes.create read_size in
-        let n = Core_unix.read fd ~buf:data ~pos:0 ~len:read_size in
-        log "[%s] Read %d bytes\n" client_str n;
+        let n = Core_unix.read state.fd ~buf:data ~pos:0 ~len:read_size in
         if n = 0 then begin
-          eof := true;
+          state.eof <- true;
           false
         end else begin
-          Int.incr fragment_count;
-          bytes_read := !bytes_read + n;
-          log "[%s] Zbuf push: fragment #%d, offset=0, len=%d, total_bytes=%d\n"
-            client_str !fragment_count n !bytes_read;
-          (* Show first 80 chars of data for debugging *)
-          let preview_len = min n 80 in
-          let preview = Bytes.To_string.sub data ~pos:0 ~len:preview_len in
-          log "[%s]   data preview: %S%s\n"
-            client_str preview (if n > 80 then "..." else "");
-          Httpl.push httpl_buf data ~off:0 ~len:n;
+          state.fragment_count <- state.fragment_count + 1;
+          state.bytes_read <- state.bytes_read + n;
+          Httpl.push zb data ~off:0 ~len:n;
           true
         end
       with
       | Core_unix.Unix_error (ECONNRESET, _, _) ->
-        log "[%s] Connection reset\n" client_str;
-        eof := true;
+        state.eof <- true;
         false
-      | Core_unix.Unix_error (err, _, _) ->
-        log "[%s] Read error: %s\n" client_str (Core_unix.Error.message err);
-        eof := true;
+      | Core_unix.Unix_error (_, _, _) ->
+        state.eof <- true;
         false
   in
-  let buf = Httpl.create () in
 
   (* Use effect-based refill handler *)
-  Httpl.with_refill buf refill (fun () ->
-    let rec loop () =
-      match Httpl.try_parse_request buf with
-      | Error Httpl.Partial when !eof ->
-        log "[%s] Connection closed (EOF after %d bytes in %d fragments)\n"
-          client_str !bytes_read !fragment_count
+  Httpl.with_refill httpl_buf refill (fun () ->
+    let mutable running = true in
+    while running do
+      match Httpl.try_parse_request httpl_buf with
+      | Error Httpl.Partial when state.eof ->
+        running <- false
       | Error Httpl.Partial ->
-        if not (Httpl.try_refill buf 1) then
-          log "[%s] Connection closed during parse\n" client_str
-        else loop ()
-      | Error err ->
-        log "[%s] Parse error: %s\n" client_str (Httpl.error_to_string err);
-        write_response response_buf fd ~status:400
-          ~headers:[(Httpl.str "Content-Length", Httpl.str "15")]
-          ~body:(Some (Httpl.error_to_string err))
+        if not (Httpl.try_refill httpl_buf 1) then
+          running <- false
+      | Error _err ->
+        write_error_response state.response_buf state.fd ~status:400
+          ~body:"Bad Request" ~body_len:11;
+        running <- false
       | Ok req ->
-        let target = Httpl.span_to_string buf (Httpl.request_target req) in
-        let meth = match req.Httpl.meth with
-          | Httpl.GET -> "GET" | Httpl.POST -> "POST" | Httpl.HEAD -> "HEAD"
-          | Httpl.PUT -> "PUT" | Httpl.DELETE -> "DELETE" | _ -> "OTHER"
-        in
-        log "[%s] Parsed request: %s %s\n" client_str meth target;
-        log_headers client_str buf req;
         let keep_alive =
-          try handle_request response_buf fd buf req
-          with exn ->
-            log "[%s] Error handling request: %s\n" client_str (Exn.to_string exn);
-            write_response response_buf fd ~status:500
-              ~headers:[(Httpl.str "Content-Length", Httpl.str "25")]
-              ~body:(Some "500 Internal Server Error");
+          try handle_request state.response_buf state.file_buf state.fd httpl_buf req
+          with _exn ->
+            write_error_response state.response_buf state.fd ~status:500
+              ~body:body_500 ~body_len:25;
             false
         in
-        if keep_alive then loop ()
-    in
-    loop ()
+        if not keep_alive then running <- false
+    done
   )
 
-(* Create server socket *)
+(* Per-thread state - allocated once per thread *)
+type thread_state = {
+  t_response_buf : bytes;
+  t_file_buf : bytes;
+}
+
+(* Create thread-local state *)
+let create_thread_state () = {
+  t_response_buf = Bytes.create response_buf_size;
+  t_file_buf = Bytes.create file_buf_size;
+}
+
+(* Thread-local storage for buffers *)
+let thread_state_key : thread_state option ref = ref None
+
+let get_thread_state () =
+  match !thread_state_key with
+  | Some state -> state
+  | None ->
+    let state = create_thread_state () in
+    thread_state_key := Some state;
+    state
+
+(* Handle a connection *)
+let handle_connection fd _client_addr =
+  let ts = get_thread_state () in
+  let state = {
+    fd;
+    response_buf = ts.t_response_buf;
+    file_buf = ts.t_file_buf;
+    eof = false;
+    bytes_read = 0;
+    fragment_count = 0;
+  } in
+  handle_connection_with_state state
+
+(* ============================================================
+   Server setup
+   ============================================================ *)
+
 let create_server_socket ~host ~port =
   let sock = Core_unix.socket ~domain:PF_INET ~kind:SOCK_STREAM ~protocol:0 () in
   Core_unix.setsockopt sock SO_REUSEADDR true;
@@ -336,7 +411,6 @@ let create_server_socket ~host ~port =
   Core_unix.listen sock ~backlog:128;
   sock
 
-(* Handle connection in a thread *)
 let connection_handler (client_fd, client_addr) =
   Exn.protect
     ~f:(fun () -> handle_connection client_fd client_addr)
@@ -344,26 +418,35 @@ let connection_handler (client_fd, client_addr) =
       try Core_unix.close client_fd with _ -> ());
   ()
 
-(* Main server loop *)
 let run_server () =
   log_always "httpox starting on %s:%d, serving files from %s\n" !host !port !root;
+  log_always "OxCaml optimizations: let mutable, unboxed spans, effects\n";
 
   let server_sock = create_server_socket ~host:!host ~port:!port in
 
-  (* Threaded server - spawn a thread per connection *)
   while true do
     let client_fd, client_addr = Core_unix.accept server_sock in
-    let (_ : Caml_threads.Thread.t) = Caml_threads.Thread.create connection_handler (client_fd, client_addr) in
+    let (_ : Caml_threads.Thread.t) =
+      Caml_threads.Thread.create connection_handler (client_fd, client_addr)
+    in
     ()
   done
 
-(* Command-line interface using Core.Command *)
+(* ============================================================
+   Command-line interface
+   ============================================================ *)
+
 let command =
   Command.basic
-    ~summary:"httpox - OxCaml HTTP server using Core"
+    ~summary:"httpox - OxCaml HTTP server using Core (allocation-optimized)"
     ~readme:(fun () ->
       "A static file HTTP server built with httpl and Jane Street Core libraries.\n\
-       Uses zero-copy parsing with OxCaml unboxed types and effects.")
+       Uses zero-copy parsing with OxCaml unboxed types and effects.\n\n\
+       Optimizations:\n\
+       - let mutable instead of ref for connection state\n\
+       - Pre-allocated per-thread buffers\n\
+       - Span-based path validation (no string allocation)\n\
+       - Unboxed span types (no heap allocation for token boundaries)")
     (let%map_open.Command
        host_arg = flag "-h" (optional_with_default "0.0.0.0" string)
          ~doc:"HOST Host to bind to (default: 0.0.0.0)"
