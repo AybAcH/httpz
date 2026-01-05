@@ -1,0 +1,4 @@
+(executable
+ (name bench_httpl)
+ (libraries httpl httplo core core_bench)
+ (preprocess (pps ppx_jane)))
