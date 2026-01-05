@@ -19,3 +19,9 @@
  (name zbufo)
  (public_name httpl.zbufo)
  (modules zbufo))
+
+(library
+ (name httpz)
+ (public_name httpl.httpz)
+ (modules httpz)
+ (libraries base))

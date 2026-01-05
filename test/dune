@@ -5,3 +5,7 @@
 (test
  (name test_zbuf)
  (libraries zbuf))
+
+(test
+ (name test_httpz)
+ (libraries httpz base stdio))
