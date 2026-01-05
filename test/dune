@@ -1,0 +1,7 @@
+(test
+ (name test_httpl)
+ (libraries httpl))
+
+(test
+ (name test_zbuf)
+ (libraries zbuf))

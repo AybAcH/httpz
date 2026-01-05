@@ -1,0 +1,5 @@
+(executable
+ (name main)
+ (public_name eewwu)
+ (package httpl)
+ (libraries httpl unix threads magic-mime))
