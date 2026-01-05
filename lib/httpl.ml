@@ -1,27 +1,33 @@
 (* httpl.ml - Zero-copy HTTP/1.1 parser and serializer using Zbuf
 
-   Design principles:
-   - No string allocation during parsing; store spans into multi-buffer zbuf
-   - Explicit materialization: strings only created on request
-   - Multi-buffer support via Zbuf for fragmented reads
-   - Concurrent parsing via independent cursors
+   OxCaml-optimized design:
+   - Unboxed span type (no allocation for token boundaries)
+   - Local cursor support where appropriate
+   - let mutable for efficient loops
 *)
 
 (* ============================================================
    Core Types
    ============================================================ *)
 
-(** Re-export span from Zbuf *)
-type span = Zbuf.span = { start: Zbuf.pos; len: int }
+(** Re-export unboxed span from Zbuf - used in hot paths, zero allocation *)
+type span = Zbuf.span = #{ start : Zbuf.pos; len : int }
 
-(** Parser state combining zbuf and cursor *)
+(** Boxed span for use in option/list containers (which require layout value) *)
+type boxed_span = { bs_start : Zbuf.pos; bs_len : int }
+
+let box_span (sp : span) : boxed_span = { bs_start = sp.#start; bs_len = sp.#len }
+let unbox_span (bs : boxed_span) : span = #{ start = bs.bs_start; len = bs.bs_len }
+
+(** Parser state combining zbuf and cursor.
+    Uses cursor_global since buffer is stored in a record. *)
 type buffer = {
-  zb: Zbuf.t;
-  cur: Zbuf.cursor;
+  zb : Zbuf.t;
+  cur : Zbuf.cursor;
 }
 
-(** Refill function: push data to buffer. Push zero-length fragment for EOF. *)
-type refill = buffer -> unit
+(** Refill function: push data to buffer, return true if data added, false for EOF. *)
+type refill = buffer -> bool
 
 (** HTTP methods - Other uses span to avoid allocation *)
 type method_ =
@@ -85,8 +91,34 @@ type header_name =
   (* Unknown header - stores span for zero-copy access *)
   | H_other of span
 
-(** A header entry with name span and value span *)
-type header_entry = { name_span: span; value: span }
+(** A header entry with name span and value span.
+    Boxed record with unboxed span fields (mixed block). *)
+type header_entry = {
+  name_span_start : Zbuf.pos;
+  name_span_len : int;
+  value_start : Zbuf.pos;
+  value_len : int;
+}
+
+(** Construct header_entry from spans *)
+let make_header_entry ~name_span ~value =
+  { name_span_start = name_span.#start;
+    name_span_len = name_span.#len;
+    value_start = value.#start;
+    value_len = value.#len }
+
+(** Get name span from header entry *)
+let header_entry_name_span e : span = #{ start = e.name_span_start; len = e.name_span_len }
+
+(** Get value span from header entry *)
+let header_entry_value e : span = #{ start = e.value_start; len = e.value_len }
+
+(** Unknown header entry: name span (as boxed record) + header_entry *)
+type unknown_header = {
+  unk_name_start : Zbuf.pos;
+  unk_name_len : int;
+  unk_entry : header_entry;
+}
 
 (* ============================================================
    Headers Module - Map-based O(log n) lookup
@@ -117,9 +149,9 @@ module Headers = struct
 
   (** Header storage: known headers in IntMap, unknown in list *)
   type t = {
-    known: (header_name * header_entry list) IntMap.t;  (** key -> (canonical_name, values) *)
-    unknown: (span * header_entry) list;  (** (name_span, entry) for H_other *)
-    count: int;
+    known : (header_name * header_entry list) IntMap.t;
+    unknown : unknown_header list;
+    count : int;
   }
 
   let empty = { known = IntMap.empty; unknown = []; count = 0 }
@@ -128,7 +160,7 @@ module Headers = struct
 
   (** Add a header. For known headers, appends to value list. *)
   let add t name ~name_span ~value =
-    let entry = { name_span; value } in
+    let entry = make_header_entry ~name_span ~value in
     let new_count = t.count + 1 in
     let key = key_of_name name in
     if key >= 0 then begin
@@ -138,46 +170,49 @@ module Headers = struct
       in
       { known = IntMap.add key entries t.known; unknown = t.unknown; count = new_count }
     end else begin
-      (* H_other - store with name span for later comparison *)
       let name_sp = match name with H_other sp -> sp | _ -> assert false in
-      { known = t.known; unknown = (name_sp, entry) :: t.unknown; count = new_count }
+      let unk = { unk_name_start = name_sp.#start;
+                  unk_name_len = name_sp.#len;
+                  unk_entry = entry } in
+      { known = t.known; unknown = unk :: t.unknown; count = new_count }
     end
 
-  (** Find first matching header by known name. O(log n) *)
-  let find_known t name =
+  (** Find first matching header by known name. O(log n).
+      Returns boxed span since option requires layout value. *)
+  let find_known t name : boxed_span option =
     let key = key_of_name name in
     if key < 0 then None
     else match IntMap.find_opt key t.known with
       | None -> None
       | Some (_, entries) ->
-        (* Return most recent (entries are in reverse order) *)
-        match entries with [] -> None | e :: _ -> Some e.value
+        match entries with [] -> None | e :: _ -> Some (box_span (header_entry_value e))
 
-  (** Find all values for a known header. Returns in order added. *)
-  let find_all_known t name =
+  (** Find all values for a known header. Returns in order added.
+      Returns boxed spans since list requires layout value. *)
+  let find_all_known t name : boxed_span list =
     let key = key_of_name name in
     if key < 0 then []
     else match IntMap.find_opt key t.known with
       | None -> []
-      | Some (_, entries) -> List.rev_map (fun e -> e.value) entries
+      | Some (_, entries) -> List.rev_map (fun e -> box_span (header_entry_value e)) entries
 
-  (** Find header by name span (for unknown headers). Needs zbuf for comparison. *)
-  let find_unknown zb t name_span =
+  (** Find header by name span (for unknown headers). Needs zbuf for comparison.
+      Returns boxed span since option requires layout value. *)
+  let find_unknown zb t name_span : boxed_span option =
     let rec loop = function
       | [] -> None
-      | (sp, entry) :: rest ->
+      | unk :: rest ->
+        let sp : span = #{ start = unk.unk_name_start; len = unk.unk_name_len } in
         if Zbuf.span_equal_caseless zb sp (Zbuf.span_to_string zb name_span) then
-          Some entry.value
+          Some (box_span (header_entry_value unk.unk_entry))
         else loop rest
     in
     loop t.unknown
 
   (** Find header by string name. Checks known first, then unknown. *)
   let find_by_string zb t name =
-    (* Try to match against known header names by length *)
     let len = String.length name in
     let try_known () =
-      (* Check common headers by length - same logic as parse_header_name *)
       let check_caseless s h =
         if String.lowercase_ascii name = s then find_known t h else None
       in
@@ -233,12 +268,13 @@ module Headers = struct
     match try_known () with
     | Some v -> Some v
     | None ->
-      (* Search unknown headers *)
       let name_lower = String.lowercase_ascii name in
       let rec loop = function
         | [] -> None
-        | (sp, entry) :: rest ->
-          if Zbuf.span_equal_caseless zb sp name_lower then Some entry.value
+        | unk :: rest ->
+          let sp : span = #{ start = unk.unk_name_start; len = unk.unk_name_len } in
+          if Zbuf.span_equal_caseless zb sp name_lower then
+            Some (box_span (header_entry_value unk.unk_entry))
           else loop rest
       in
       loop t.unknown
@@ -246,40 +282,56 @@ module Headers = struct
   (** Iterate over all headers in order (known first, then unknown) *)
   let iter f t =
     IntMap.iter (fun _ (name, entries) ->
-      List.iter (fun e -> f name e.name_span e.value) (List.rev entries)
+      List.iter (fun e ->
+        f name (header_entry_name_span e) (header_entry_value e)
+      ) (List.rev entries)
     ) t.known;
-    List.iter (fun (name_sp, e) ->
-      f (H_other name_sp) e.name_span e.value
+    List.iter (fun unk ->
+      let name_sp : span = #{ start = unk.unk_name_start; len = unk.unk_name_len } in
+      let e = unk.unk_entry in
+      f (H_other name_sp) (header_entry_name_span e) (header_entry_value e)
     ) (List.rev t.unknown)
 
   (** Fold over all headers *)
   let fold f t init =
     let acc = IntMap.fold (fun _ (name, entries) acc ->
-      List.fold_left (fun acc e -> f acc name e.name_span e.value) acc (List.rev entries)
+      List.fold_left (fun acc e ->
+        f acc name (header_entry_name_span e) (header_entry_value e)
+      ) acc (List.rev entries)
     ) t.known init in
-    List.fold_left (fun acc (name_sp, e) ->
-      f acc (H_other name_sp) e.name_span e.value
+    List.fold_left (fun acc unk ->
+      let name_sp : span = #{ start = unk.unk_name_start; len = unk.unk_name_len } in
+      let e = unk.unk_entry in
+      f acc (H_other name_sp) (header_entry_name_span e) (header_entry_value e)
     ) acc (List.rev t.unknown)
 end
 
 (** Legacy header type for compatibility *)
-type header = { name: header_name; name_span: span; value: span }
+type header = { name : header_name; name_span : span; value : span }
 
-(** Parsed request - all strings are spans *)
+(** Parsed request - uses boxed span storage for layout compatibility *)
 type request = {
-  meth: method_;
-  target: span;
-  version: version;
-  headers: Headers.t;
+  meth : method_;
+  target_start : Zbuf.pos;
+  target_len : int;
+  version : version;
+  headers : Headers.t;
 }
 
-(** Parsed response *)
+(** Get target span from request *)
+let request_target r : span = #{ start = r.target_start; len = r.target_len }
+
+(** Parsed response - uses boxed span storage for layout compatibility *)
 type response = {
-  version: version;
-  status: int;
-  reason: span;
-  headers: Headers.t;
+  version : version;
+  status : int;
+  reason_start : Zbuf.pos;
+  reason_len : int;
+  headers : Headers.t;
 }
+
+(** Get reason span from response *)
+let response_reason r : span = #{ start = r.reason_start; len = r.reason_len }
 
 (** Parse errors *)
 type error =
@@ -310,19 +362,26 @@ let error_to_string = function
 
 let default_size = 8192
 
-(** Create a buffer (zbuf + cursor) *)
+(** Create a buffer (zbuf + cursor).
+    Uses cursor_global since buffer is stored in a record. *)
 let create () =
   let zb = Zbuf.create () in
-  let cur = Zbuf.cursor zb ~pos:0 in
+  let cur = Zbuf.cursor_global zb ~pos:0 in
   { zb; cur }
 
 (** Push data to buffer *)
 let push buf data ~off ~len =
   Zbuf.push buf.zb data ~off ~len
 
+(** Run with refill handler.
+    Adapts buffer-based refill to zbuf's t-based refill. *)
 let with_refill buf refill f =
-  let zbuf_refill _zb = refill buf in
-  Zbuf.with_refill buf.zb buf.cur zbuf_refill f
+  let zbuf_refill zb =
+    (* Create a temporary buffer wrapper for the refill callback *)
+    ignore zb;  (* We use buf.zb which is the same *)
+    refill buf
+  in
+  Zbuf.with_refill buf.zb zbuf_refill f
 
 (** Mark the start of a parse operation *)
 let mark buf =
@@ -333,8 +392,7 @@ let mark buf =
 let[@inline] peek buf off =
   Zbuf.peek buf.zb buf.cur off
 
-(** Try to ensure n bytes available. Returns true if ok, false if EOF.
-    Used for body reading where EOF is not an error. *)
+(** Try to ensure n bytes available. Returns true if ok, false if EOF. *)
 let try_refill buf n =
   Zbuf.ensure buf.zb buf.cur n
 
@@ -389,8 +447,7 @@ let span_fold f (buf : buffer) (sp : span) init =
 
 (** Parse header name span into typed variant (case-insensitive) *)
 let parse_header_name (buf : buffer) (sp : span) : header_name =
-  (* Use length-based dispatch for efficiency *)
-  match sp.len with
+  match sp.#len with
   | 3 ->
     if span_equal_caseless buf sp "age" then H_age
     else if span_equal_caseless buf sp "via" then H_via
@@ -417,7 +474,7 @@ let parse_header_name (buf : buffer) (sp : span) : header_name =
     else H_other sp
   | 8 ->
     if span_equal_caseless buf sp "if-match" then H_if_match
-    else if span_equal_caseless buf sp "if-range" then H_if_match  (* Note: if-range is 8 chars *)
+    else if span_equal_caseless buf sp "if-range" then H_if_match
     else if span_equal_caseless buf sp "location" then H_location
     else H_other sp
   | 10 ->
@@ -517,20 +574,19 @@ let header_name_to_string (buf : buffer) = function
 (** Check if header name matches a variant *)
 let header_name_equal name1 name2 =
   match name1, name2 with
-  | H_other _, _ | _, H_other _ -> false  (* Other headers need span comparison *)
+  | H_other _, _ | _, H_other _ -> false
   | _ -> name1 = name2
 
 (* ============================================================
    Low-level Parsing Helpers
    ============================================================ *)
 
-(** Take bytes while predicate holds, return span. At least 1 byte required.
-    Uses effect-based refilling via Zbuf.scan_while. *)
+(** Take bytes while predicate holds, return span. At least 1 byte required. *)
 let take_while1 pred buf =
   Zbuf.cursor_mark buf.cur;
   ignore (Zbuf.scan_while pred buf.zb buf.cur);
   let sp = Zbuf.span_since_mark buf.cur in
-  if sp.len = 0 then raise (Parse_error Partial);
+  if sp.#len = 0 then raise (Parse_error Partial);
   sp
 
 (** Take bytes while predicate holds, return span. Zero bytes allowed. *)
@@ -552,13 +608,15 @@ let expect_crlf buf =
 
 (** Find CRLF from current position, returns offset from cursor or raises *)
 let find_crlf buf =
-  let rec scan off =
+  let mutable off = 0 in
+  let mutable found = false in
+  while not found do
     if peek buf off = '\r' && peek buf (off + 1) = '\n' then
-      off
+      found <- true
     else
-      scan (off + 1)
-  in
-  scan 0
+      off <- off + 1
+  done;
+  off
 
 (* ============================================================
    Request Parsing
@@ -567,43 +625,39 @@ let find_crlf buf =
 (** Parse HTTP method *)
 let parse_method buf =
   let sp = take_while1 is_tchar buf in
-  (* Match common methods without allocation *)
-  if sp.len = 3 then begin
+  match sp.#len with
+  | 3 ->
     if span_equal buf sp "GET" then GET
     else if span_equal buf sp "PUT" then PUT
     else Other sp
-  end else if sp.len = 4 then begin
+  | 4 ->
     if span_equal buf sp "POST" then POST
     else if span_equal buf sp "HEAD" then HEAD
     else Other sp
-  end else if sp.len = 5 then begin
+  | 5 ->
     if span_equal buf sp "PATCH" then PATCH
     else if span_equal buf sp "TRACE" then TRACE
     else Other sp
-  end else if sp.len = 6 then begin
+  | 6 ->
     if span_equal buf sp "DELETE" then DELETE
     else Other sp
-  end else if sp.len = 7 then begin
+  | 7 ->
     if span_equal buf sp "OPTIONS" then OPTIONS
     else if span_equal buf sp "CONNECT" then CONNECT
     else Other sp
-  end else
-    Other sp
+  | _ -> Other sp
 
 (** Parse request target (until SP) *)
 let parse_target buf =
   Zbuf.cursor_mark buf.cur;
-  let rec scan () =
+  let mutable scanning = true in
+  while scanning do
     let c = peek buf 0 in
-    if c = ' ' || c = '\r' then ()
-    else begin
-      consume buf 1;
-      scan ()
-    end
-  in
-  scan ();
+    if c = ' ' || c = '\r' then scanning <- false
+    else consume buf 1
+  done;
   let sp = Zbuf.span_since_mark buf.cur in
-  if sp.len = 0 then raise (Parse_error Invalid_target);
+  if sp.#len = 0 then raise (Parse_error Invalid_target);
   sp
 
 (** Parse HTTP version (HTTP/1.0 or HTTP/1.1) *)
@@ -619,8 +673,16 @@ let parse_version buf =
   else
     raise (Parse_error Invalid_version)
 
+(** Result of parsing a request line - record to avoid tuple layout constraints *)
+type request_line = {
+  rl_meth : method_;
+  rl_target_start : Zbuf.pos;
+  rl_target_len : int;
+  rl_version : version;
+}
+
 (** Parse request line: METHOD SP request-target SP HTTP-version CRLF *)
-let parse_request_line buf =
+let parse_request_line buf : request_line =
   let meth = parse_method buf in
   if peek buf 0 <> ' ' then raise (Parse_error Invalid_method);
   consume buf 1;
@@ -629,7 +691,10 @@ let parse_request_line buf =
   consume buf 1;
   let version = parse_version buf in
   expect_crlf buf;
-  (meth, target, version)
+  { rl_meth = meth;
+    rl_target_start = target.#start;
+    rl_target_len = target.#len;
+    rl_version = version }
 
 (* ============================================================
    Header Parsing
@@ -637,54 +702,58 @@ let parse_request_line buf =
 
 (** Parse a single header, returns None at end of headers *)
 let parse_header buf =
-  (* Check for empty line (end of headers) *)
   if peek buf 0 = '\r' && peek buf 1 = '\n' then begin
     consume buf 2;
     None
   end else begin
-    (* Parse header name (token) *)
     let name_span = take_while1 is_tchar buf in
     let name = parse_header_name buf name_span in
-    (* Expect colon *)
     if peek buf 0 <> ':' then raise (Parse_error Invalid_header);
     consume buf 1;
-    (* Skip OWS *)
     skip_ows buf;
-    (* Find end of value (CRLF) and mark start *)
     let value_start = Zbuf.cursor_pos buf.cur in
     let crlf_off = find_crlf buf in
-    (* Trim trailing OWS from value - data already in buffer from find_crlf *)
-    let rec trim_end off =
-      if off <= 0 then 0
-      else if is_space (peek buf (off - 1)) then trim_end (off - 1)
-      else off
-    in
-    let value_len = trim_end crlf_off in
-    let value = { start = value_start; len = value_len } in
-    consume buf (crlf_off + 2);  (* Skip value + CRLF *)
+    (* Trim trailing OWS from value using let mutable *)
+    let mutable end_off = crlf_off in
+    while end_off > 0 && is_space (peek buf (end_off - 1)) do
+      end_off <- end_off - 1
+    done;
+    let value = #{ start = value_start; len = end_off } in
+    consume buf (crlf_off + 2);
     Some { name; name_span; value }
   end
 
 (** Empty header for array initialization *)
-let empty_header = { name = H_other { start = 0; len = 0 }; name_span = { start = 0; len = 0 }; value = { start = 0; len = 0 } }
+let empty_header = {
+  name = H_other #{ start = 0; len = 0 };
+  name_span = #{ start = 0; len = 0 };
+  value = #{ start = 0; len = 0 }
+}
 
 (** Parse all headers into Headers.t map *)
 let parse_headers ?(max_headers = 100) buf =
-  let rec loop hdrs count =
-    if count >= max_headers then raise (Parse_error Too_many_headers)
-    else match parse_header buf with
-      | None -> hdrs
-      | Some h ->
-        let hdrs = Headers.add hdrs h.name ~name_span:h.name_span ~value:h.value in
-        loop hdrs (count + 1)
-  in
-  loop Headers.empty 0
+  let mutable hdrs = Headers.empty in
+  let mutable count = 0 in
+  let mutable done_ = false in
+  while not done_ do
+    if count >= max_headers then raise (Parse_error Too_many_headers);
+    match parse_header buf with
+    | None -> done_ <- true
+    | Some h ->
+      hdrs <- Headers.add hdrs h.name ~name_span:h.name_span ~value:h.value;
+      count <- count + 1
+  done;
+  hdrs
 
 (** Parse complete HTTP request *)
 let parse_request ?(max_headers = 100) buf =
-  let meth, target, version = parse_request_line buf in
+  let rl = parse_request_line buf in
   let headers = parse_headers ~max_headers buf in
-  { meth; target; version; headers }
+  { meth = rl.rl_meth;
+    target_start = rl.rl_target_start;
+    target_len = rl.rl_target_len;
+    version = rl.rl_version;
+    headers }
 
 (* ============================================================
    Response Parsing
@@ -704,12 +773,20 @@ let parse_status buf =
 let parse_reason buf =
   let start = Zbuf.cursor_pos buf.cur in
   let crlf_off = find_crlf buf in
-  let sp = { start; len = crlf_off } in
+  let sp = #{ start; len = crlf_off } in
   consume buf (crlf_off + 2);
   sp
 
+(** Result of parsing a status line - record to avoid tuple layout constraints *)
+type status_line = {
+  sl_version : version;
+  sl_status : int;
+  sl_reason_start : Zbuf.pos;
+  sl_reason_len : int;
+}
+
 (** Parse status line: HTTP-version SP status-code SP reason-phrase CRLF *)
-let parse_status_line buf =
+let parse_status_line buf : status_line =
   let version = parse_version buf in
   if peek buf 0 <> ' ' then raise (Parse_error Invalid_version);
   consume buf 1;
@@ -717,13 +794,20 @@ let parse_status_line buf =
   if peek buf 0 <> ' ' then raise (Parse_error Invalid_status);
   consume buf 1;
   let reason = parse_reason buf in
-  (version, status, reason)
+  { sl_version = version;
+    sl_status = status;
+    sl_reason_start = reason.#start;
+    sl_reason_len = reason.#len }
 
 (** Parse complete HTTP response *)
 let parse_response ?(max_headers = 100) buf =
-  let version, status, reason = parse_status_line buf in
+  let sl = parse_status_line buf in
   let headers = parse_headers ~max_headers buf in
-  { version; status; reason; headers }
+  { version = sl.sl_version;
+    status = sl.sl_status;
+    reason_start = sl.sl_reason_start;
+    reason_len = sl.sl_reason_len;
+    headers }
 
 (* ============================================================
    Materialization Functions
@@ -747,74 +831,74 @@ let version_to_string = function
   | HTTP_1_0 -> "HTTP/1.0"
   | HTTP_1_1 -> "HTTP/1.1"
 
-(** Find header by header_name variant, return value span. O(log n) for known headers. *)
-let find_header (_buf : buffer) (req : request) (target : header_name) : span option =
+(** Find header by header_name variant, return boxed value span. O(log n) for known headers. *)
+let find_header (_buf : buffer) (req : request) (target : header_name) : boxed_span option =
   Headers.find_known req.headers target
 
-(** Find header by string name (case-insensitive), return value span *)
-let find_header_span (buf : buffer) (req : request) (name : string) : span option =
+(** Find header by string name (case-insensitive), return boxed value span *)
+let find_header_span (buf : buffer) (req : request) (name : string) : boxed_span option =
   Headers.find_by_string buf.zb req.headers name
+
+(** Materialize a boxed span to string *)
+let boxed_span_to_string (buf : buffer) (bs : boxed_span) : string =
+  Zbuf.span_to_string buf.zb (unbox_span bs)
 
 (** Find header by variant and materialize value *)
 let get_header_by_name (buf : buffer) (req : request) (target : header_name) : string option =
-  Option.map (span_to_string buf) (find_header buf req target)
+  Option.map (boxed_span_to_string buf) (find_header buf req target)
 
 (** Find header by string and materialize value *)
 let get_header (buf : buffer) (req : request) (name : string) : string option =
-  Option.map (span_to_string buf) (find_header_span buf req name)
+  Option.map (boxed_span_to_string buf) (find_header_span buf req name)
 
 (** Get all headers matching variant name *)
 let get_headers_by_name (buf : buffer) (req : request) (target : header_name) : string list =
-  List.map (span_to_string buf) (Headers.find_all_known req.headers target)
+  List.map (boxed_span_to_string buf) (Headers.find_all_known req.headers target)
 
 (** Get all headers matching string name *)
 let get_headers (buf : buffer) (req : request) (name : string) : string list =
-  (* For now, use find_header_span for first value, then check if it's a multi-value header *)
   match find_header_span buf req name with
   | None -> []
-  | Some sp -> [span_to_string buf sp]
-  (* TODO: implement proper multi-value lookup for string names *)
+  | Some bs -> [boxed_span_to_string buf bs]
 
-(** Get content-length if present (uses variant for efficiency) *)
+(** Get content-length if present *)
 let content_length (buf : buffer) (req : request) : int64 option =
   Option.bind (find_header buf req H_content_length)
-    (fun sp -> Int64.of_string_opt (span_to_string buf sp))
+    (fun bs -> Int64.of_string_opt (boxed_span_to_string buf bs))
 
-(** Check if transfer-encoding is chunked (uses variant for efficiency) *)
+(** Check if transfer-encoding is chunked *)
 let is_chunked (buf : buffer) (req : request) : bool =
   find_header buf req H_transfer_encoding
-  |> Option.map (fun sp -> span_equal_caseless buf sp "chunked")
+  |> Option.map (fun bs -> span_equal_caseless buf (unbox_span bs) "chunked")
   |> Option.value ~default:false
 
-(** Check connection header (uses variant for efficiency) *)
+(** Check connection header *)
 let is_keep_alive (buf : buffer) (req : request) : bool =
   match find_header buf req H_connection with
-  | None -> req.version = HTTP_1_1  (* HTTP/1.1 defaults to keep-alive *)
-  | Some sp ->
-    if span_equal_caseless buf sp "close" then false
-    else if span_equal_caseless buf sp "keep-alive" then true
+  | None -> req.version = HTTP_1_1
+  | Some bs ->
+    if span_equal_caseless buf (unbox_span bs) "close" then false
+    else if span_equal_caseless buf (unbox_span bs) "keep-alive" then true
     else req.version = HTTP_1_1
 
 (* Response helpers *)
 
-(** Find response header by variant *)
-let find_header_resp (_buf : buffer) (resp : response) (target : header_name) : span option =
+let find_header_resp (_buf : buffer) (resp : response) (target : header_name) : boxed_span option =
   Headers.find_known resp.headers target
 
-(** Find response header by string name *)
-let find_header_span_resp buf resp name =
+let find_header_span_resp buf resp name : boxed_span option =
   Headers.find_by_string buf.zb resp.headers name
 
 let get_header_resp buf resp name =
-  Option.map (span_to_string buf) (find_header_span_resp buf resp name)
+  Option.map (boxed_span_to_string buf) (find_header_span_resp buf resp name)
 
 let content_length_resp buf resp =
   Option.bind (find_header_resp buf resp H_content_length)
-    (fun sp -> Int64.of_string_opt (span_to_string buf sp))
+    (fun bs -> Int64.of_string_opt (boxed_span_to_string buf bs))
 
 let is_chunked_resp buf resp =
   find_header_resp buf resp H_transfer_encoding
-  |> Option.map (fun sp -> span_equal_caseless buf sp "chunked")
+  |> Option.map (fun bs -> span_equal_caseless buf (unbox_span bs) "chunked")
   |> Option.value ~default:false
 
 (* ============================================================
@@ -826,11 +910,9 @@ type out =
   | Span of buffer * span
   | Str of string
 
-(** Convenience constructors *)
 let str s = Str s
 let out_span buf sp = Span (buf, sp)
 
-(** Write out value to bytes, returns number of bytes written *)
 let write_out dst ~pos = function
   | Str s ->
     let len = String.length s in
@@ -838,26 +920,22 @@ let write_out dst ~pos = function
     len
   | Span (buf, sp) ->
     Zbuf.span_blit buf.zb sp dst ~dst_off:pos;
-    sp.len
+    sp.#len
 
-(** Write CRLF *)
 let write_crlf dst ~pos =
   Bytes.set dst pos '\r';
   Bytes.set dst (pos + 1) '\n';
   2
 
-(** Write SP *)
 let write_sp dst ~pos =
   Bytes.set dst pos ' ';
   1
 
-(** Write ": " *)
 let write_colon_sp dst ~pos =
   Bytes.set dst pos ':';
   Bytes.set dst (pos + 1) ' ';
   2
 
-(** Write method *)
 let write_method dst ~pos = function
   | GET -> Bytes.blit_string "GET" 0 dst pos 3; 3
   | POST -> Bytes.blit_string "POST" 0 dst pos 4; 4
@@ -870,93 +948,80 @@ let write_method dst ~pos = function
   | CONNECT -> Bytes.blit_string "CONNECT" 0 dst pos 7; 7
   | Other _span -> failwith "Cannot write Other method without buffer"
 
-(** Write method from parsed request (can handle Other) *)
 let write_method_from ~src dst ~pos = function
   | Other sp ->
     Zbuf.span_blit src.zb sp dst ~dst_off:pos;
-    sp.len
+    sp.#len
   | m -> write_method dst ~pos m
 
-(** Write version *)
 let write_version dst ~pos = function
   | HTTP_1_0 -> Bytes.blit_string "HTTP/1.0" 0 dst pos 8; 8
   | HTTP_1_1 -> Bytes.blit_string "HTTP/1.1" 0 dst pos 8; 8
 
-(** Write status code *)
 let write_status_code dst ~pos status =
   Bytes.set dst pos (Char.chr (48 + status / 100));
   Bytes.set dst (pos + 1) (Char.chr (48 + (status / 10) mod 10));
   Bytes.set dst (pos + 2) (Char.chr (48 + status mod 10));
   3
 
-(** Write request line *)
 let write_request_line dst ~pos ~method_ ~target ~version =
-  let p = pos in
-  let p = p + write_out dst ~pos:p method_ in
-  let p = p + write_sp dst ~pos:p in
-  let p = p + write_out dst ~pos:p target in
-  let p = p + write_sp dst ~pos:p in
-  let p = p + write_version dst ~pos:p version in
-  let p = p + write_crlf dst ~pos:p in
+  let mutable p = pos in
+  p <- p + write_out dst ~pos:p method_;
+  p <- p + write_sp dst ~pos:p;
+  p <- p + write_out dst ~pos:p target;
+  p <- p + write_sp dst ~pos:p;
+  p <- p + write_version dst ~pos:p version;
+  p <- p + write_crlf dst ~pos:p;
   p - pos
 
-(** Write status line *)
 let write_status_line dst ~pos ~version ~status ~reason =
-  let p = pos in
-  let p = p + write_version dst ~pos:p version in
-  let p = p + write_sp dst ~pos:p in
-  let p = p + write_status_code dst ~pos:p status in
-  let p = p + write_sp dst ~pos:p in
-  let p = p + write_out dst ~pos:p reason in
-  let p = p + write_crlf dst ~pos:p in
+  let mutable p = pos in
+  p <- p + write_version dst ~pos:p version;
+  p <- p + write_sp dst ~pos:p;
+  p <- p + write_status_code dst ~pos:p status;
+  p <- p + write_sp dst ~pos:p;
+  p <- p + write_out dst ~pos:p reason;
+  p <- p + write_crlf dst ~pos:p;
   p - pos
 
-(** Write a single header *)
 let write_header dst ~pos ~name ~value =
-  let p = pos in
-  let p = p + write_out dst ~pos:p name in
-  let p = p + write_colon_sp dst ~pos:p in
-  let p = p + write_out dst ~pos:p value in
-  let p = p + write_crlf dst ~pos:p in
+  let mutable p = pos in
+  p <- p + write_out dst ~pos:p name;
+  p <- p + write_colon_sp dst ~pos:p;
+  p <- p + write_out dst ~pos:p value;
+  p <- p + write_crlf dst ~pos:p;
   p - pos
 
-(** Write headers from list, plus final CRLF *)
 let write_headers dst ~pos headers =
   let p = List.fold_left (fun p (name, value) ->
-      p + write_header dst ~pos:p ~name ~value
-    ) pos headers
-  in
+    p + write_header dst ~pos:p ~name ~value
+  ) pos headers in
   let p = p + write_crlf dst ~pos:p in
   p - pos
 
-(** Write complete request *)
 let write_request dst ~pos ~method_ ~target ~version ~headers =
-  let p = pos in
-  let p = p + write_request_line dst ~pos:p ~method_ ~target ~version in
-  let p = p + write_headers dst ~pos:p headers in
+  let mutable p = pos in
+  p <- p + write_request_line dst ~pos:p ~method_ ~target ~version;
+  p <- p + write_headers dst ~pos:p headers;
   p - pos
 
-(** Write complete response *)
 let write_response dst ~pos ~version ~status ~reason ~headers =
-  let p = pos in
-  let p = p + write_status_line dst ~pos:p ~version ~status ~reason in
-  let p = p + write_headers dst ~pos:p headers in
+  let mutable p = pos in
+  p <- p + write_status_line dst ~pos:p ~version ~status ~reason;
+  p <- p + write_headers dst ~pos:p headers;
   p - pos
 
-(** Write chunk header (size in hex + CRLF) *)
 let write_chunk_header dst ~pos size =
   let hex = Printf.sprintf "%x" size in
   let len = String.length hex in
   Bytes.blit_string hex 0 dst pos len;
-  let p = pos + len in
-  let p = p + write_crlf dst ~pos:p in
+  let mutable p = pos + len in
+  p <- p + write_crlf dst ~pos:p;
   p - pos
 
-(** Write chunk trailer (CRLF after chunk data) *)
 let write_chunk_trailer dst ~pos =
   write_crlf dst ~pos
 
-(** Write final chunk (0\r\n\r\n) *)
 let write_final_chunk dst ~pos =
   Bytes.blit_string "0\r\n\r\n" 0 dst pos 5;
   5
@@ -981,60 +1046,53 @@ let try_parse_response ?max_headers buf =
    Body Reading
    ============================================================ *)
 
-(** Transfer encoding detection *)
 type transfer =
   | Fixed of int64
   | Chunked
   | Close_delimited
   | No_body
 
-(** Determine transfer encoding from request *)
 let transfer_of_request (buf : buffer) (req : request) : transfer =
   if is_chunked buf req then Chunked
   else match content_length buf req with
     | Some 0L -> No_body
     | Some len -> Fixed len
-    | None -> No_body  (* Requests without Content-Length have no body *)
+    | None -> No_body
 
-(** Determine transfer encoding from response *)
 let transfer_of_response (buf : buffer) (resp : response) : transfer =
-  (* 1xx, 204, 304 have no body *)
   if resp.status < 200 || resp.status = 204 || resp.status = 304 then No_body
   else if is_chunked_resp buf resp then Chunked
   else match content_length_resp buf resp with
     | Some 0L -> No_body
     | Some len -> Fixed len
-    | None -> Close_delimited  (* Responses may use close-delimited *)
+    | None -> Close_delimited
 
-(** Body reader state *)
 type body_reader =
-  | Fixed_body of { mutable remaining: int64 }
+  | Fixed_body of { mutable remaining : int64 }
   | Chunked_body of {
-      mutable chunk_remaining: int64;
-      mutable done_: bool;
-      mutable trailers: Headers.t option;
+      mutable chunk_remaining : int64;
+      mutable done_ : bool;
+      mutable trailers : Headers.t option;
     }
   | Close_body
   | Empty_body
 
-(** Create a body reader from transfer encoding *)
 let body_reader_of_transfer = function
   | Fixed len -> Fixed_body { remaining = len }
   | Chunked -> Chunked_body { chunk_remaining = 0L; done_ = false; trailers = None }
   | Close_delimited -> Close_body
   | No_body -> Empty_body
 
-(** Create body reader for request *)
 let body_reader_of_request buf req =
   body_reader_of_transfer (transfer_of_request buf req)
 
-(** Create body reader for response *)
 let body_reader_of_response buf resp =
   body_reader_of_transfer (transfer_of_response buf resp)
 
-(** Parse hex chunk size *)
 let parse_chunk_size buf =
-  let rec parse_hex acc =
+  let mutable acc = 0L in
+  let mutable parsing = true in
+  while parsing do
     let c = peek buf 0 in
     let digit = match c with
       | '0'..'9' -> Some (Char.code c - 48)
@@ -1045,30 +1103,23 @@ let parse_chunk_size buf =
     match digit with
     | Some d ->
       consume buf 1;
-      parse_hex (Int64.add (Int64.shift_left acc 4) (Int64.of_int d))
-    | None -> acc
-  in
-  let size = parse_hex 0L in
-  (* Skip chunk extensions (;name=value) until CRLF *)
-  let rec skip_to_crlf () =
+      acc <- Int64.add (Int64.shift_left acc 4) (Int64.of_int d)
+    | None -> parsing <- false
+  done;
+  (* Skip chunk extensions until CRLF *)
+  let mutable skipping = true in
+  while skipping do
     match peek buf 0 with
     | '\r' ->
-      if peek buf 1 = '\n' then
-        consume buf 2
-      else begin
-        consume buf 1;
-        skip_to_crlf ()
-      end
-    | _ ->
-      consume buf 1;
-      skip_to_crlf ()
-  in
-  skip_to_crlf ();
-  size
+      if peek buf 1 = '\n' then begin
+        consume buf 2;
+        skipping <- false
+      end else
+        consume buf 1
+    | _ -> consume buf 1
+  done;
+  acc
 
-(** Read body data into destination buffer.
-    Returns number of bytes read, or 0 for EOF.
-    This copies data from the internal buffer to dst. *)
 let rec body_read (buf : buffer) (reader : body_reader) (dst : bytes) ~(off : int) ~(len : int) : int =
   match reader with
   | Empty_body -> 0
@@ -1083,9 +1134,8 @@ let rec body_read (buf : buffer) (reader : body_reader) (dst : bytes) ~(off : in
         else 0
       end else begin
         let to_read = min want available in
-        (* Read bytes from zbuf into dst *)
         let src_pos = Zbuf.cursor_pos buf.cur in
-        let sp = { start = src_pos; len = to_read } in
+        let sp = #{ start = src_pos; len = to_read } in
         Zbuf.span_blit buf.zb sp dst ~dst_off:off;
         consume buf to_read;
         state.remaining <- Int64.sub state.remaining (Int64.of_int to_read);
@@ -1101,7 +1151,7 @@ let rec body_read (buf : buffer) (reader : body_reader) (dst : bytes) ~(off : in
     end else begin
       let to_read = min len available in
       let src_pos = Zbuf.cursor_pos buf.cur in
-      let sp = { start = src_pos; len = to_read } in
+      let sp = #{ start = src_pos; len = to_read } in
       Zbuf.span_blit buf.zb sp dst ~dst_off:off;
       consume buf to_read;
       to_read
@@ -1110,11 +1160,9 @@ let rec body_read (buf : buffer) (reader : body_reader) (dst : bytes) ~(off : in
   | Chunked_body state ->
     if state.done_ && state.chunk_remaining = 0L then 0
     else begin
-      (* Need to read next chunk header? *)
       if state.chunk_remaining = 0L && not state.done_ then begin
         let size = parse_chunk_size buf in
         if size = 0L then begin
-          (* Final chunk - parse trailers *)
           state.done_ <- true;
           let trailers = parse_headers buf in
           state.trailers <- Some trailers;
@@ -1132,11 +1180,10 @@ let rec body_read (buf : buffer) (reader : body_reader) (dst : bytes) ~(off : in
         end else begin
           let to_read = min want available in
           let src_pos = Zbuf.cursor_pos buf.cur in
-          let sp = { start = src_pos; len = to_read } in
+          let sp = #{ start = src_pos; len = to_read } in
           Zbuf.span_blit buf.zb sp dst ~dst_off:off;
           consume buf to_read;
           state.chunk_remaining <- Int64.sub state.chunk_remaining (Int64.of_int to_read);
-          (* If chunk is done, consume trailing CRLF *)
           if state.chunk_remaining = 0L && not state.done_ then begin
             if try_refill buf 2 && peek buf 0 = '\r' && peek buf 1 = '\n' then
               consume buf 2
@@ -1146,67 +1193,56 @@ let rec body_read (buf : buffer) (reader : body_reader) (dst : bytes) ~(off : in
       end
     end
 
-(** Read body as a span into the buffer (zero-copy for small bodies).
-    Only works for Fixed-length bodies that fit in the buffer.
-    Returns None if body is too large or not fixed-length. *)
-let body_read_span (buf : buffer) (reader : body_reader) : span option =
+let body_read_span (buf : buffer) (reader : body_reader) : boxed_span option =
   match reader with
-  | Empty_body -> Some { start = Zbuf.cursor_pos buf.cur; len = 0 }
+  | Empty_body -> Some (box_span #{ start = Zbuf.cursor_pos buf.cur; len = 0 })
   | Fixed_body state ->
     let len = Int64.to_int state.remaining in
-    if len > 1024 * 1024 then None  (* Too large for single span *)
+    if len > 1024 * 1024 then None
     else if not (try_refill buf len) then None
     else begin
       let start = Zbuf.cursor_pos buf.cur in
-      let sp = { start; len } in
+      let sp = #{ start; len } in
       consume buf len;
       state.remaining <- 0L;
-      Some sp
+      Some (box_span sp)
     end
-  | Chunked_body _ -> None  (* Can't do zero-copy for chunked *)
-  | Close_body -> None  (* Can't know size upfront *)
+  | Chunked_body _ -> None
+  | Close_body -> None
 
-(** Read entire body as string *)
 let body_read_string (buf : buffer) (reader : body_reader) : string =
   match reader with
   | Empty_body -> ""
   | Fixed_body state when state.remaining <= 65536L ->
-    (* Small fixed body - use span *)
     (match body_read_span buf reader with
-     | Some sp -> span_to_string buf sp
+     | Some bs -> Zbuf.span_to_string buf.zb (unbox_span bs)
      | None -> "")
   | _ ->
-    (* Large or streaming body - accumulate *)
     let result = Buffer.create 4096 in
     let chunk = Bytes.create 4096 in
-    let rec loop () =
+    let mutable reading = true in
+    while reading do
       let n = body_read buf reader chunk ~off:0 ~len:4096 in
-      if n > 0 then begin
-        Buffer.add_subbytes result chunk 0 n;
-        loop ()
-      end
-    in
-    loop ();
+      if n > 0 then Buffer.add_subbytes result chunk 0 n
+      else reading <- false
+    done;
     Buffer.contents result
 
-(** Drain body without reading content *)
 let body_drain (buf : buffer) (reader : body_reader) : unit =
   let chunk = Bytes.create 4096 in
-  let rec loop () =
+  let mutable draining = true in
+  while draining do
     let n = body_read buf reader chunk ~off:0 ~len:4096 in
-    if n > 0 then loop ()
-  in
-  loop ()
+    if n = 0 then draining <- false
+  done
 
-(** Check if body is fully read *)
 let body_is_done (reader : body_reader) : bool =
   match reader with
   | Empty_body -> true
   | Fixed_body state -> state.remaining = 0L
   | Chunked_body state -> state.done_ && state.chunk_remaining = 0L
-  | Close_body -> false  (* Can't know until EOF *)
+  | Close_body -> false
 
-(** Get trailers from chunked body (only available after body is fully read) *)
 let body_trailers (reader : body_reader) : Headers.t option =
   match reader with
   | Chunked_body { done_ = true; trailers = Some t; _ } -> Some t

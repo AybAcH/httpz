@@ -6,30 +6,34 @@ open Httpl
    Test Utilities
    ============================================================ *)
 
-(** Create a buffer and refill function from a string *)
+(** Create a buffer and refill function from a string.
+    Refill returns bool: true if data added, false for EOF. *)
 let buffer_and_refill_of_string s =
   let refilled = ref false in
   let buf = create () in
   let refill buf =
     if !refilled then
-      push buf Bytes.empty ~off:0 ~len:0  (* EOF marker *)
+      false  (* EOF *)
     else begin
       refilled := true;
-      push buf (Bytes.of_string s) ~off:0 ~len:(String.length s)
+      push buf (Bytes.of_string s) ~off:0 ~len:(String.length s);
+      true  (* data added *)
     end
   in
   (buf, refill)
 
-(** Create a buffer and refill function from chunks *)
+(** Create a buffer and refill function from chunks.
+    Refill returns bool: true if data added, false for EOF. *)
 let buffer_and_refill_of_chunks chunks =
   let remaining = ref chunks in
   let buf = create () in
   let refill buf =
     match !remaining with
-    | [] -> push buf Bytes.empty ~off:0 ~len:0  (* EOF marker *)
+    | [] -> false  (* EOF *)
     | chunk :: rest ->
       remaining := rest;
-      push buf (Bytes.of_string chunk) ~off:0 ~len:(String.length chunk)
+      push buf (Bytes.of_string chunk) ~off:0 ~len:(String.length chunk);
+      true  (* data added *)
   in
   (buf, refill)
 
@@ -105,9 +109,9 @@ let test_span_to_string () =
   with_string_buffer "hello world" (fun buf ->
     (* peek triggers refill *)
     ignore (peek buf 10);
-    let sp = { start = 0; len = 5 } in
+    let sp = #{ start = 0; len = 5 } in
     assert_equal ~msg:"span_to_string" "hello" (span_to_string buf sp);
-    let sp2 = { start = 6; len = 5 } in
+    let sp2 = #{ start = 6; len = 5 } in
     assert_equal ~msg:"span_to_string 2" "world" (span_to_string buf sp2);
     pass "span_to_string")
 
@@ -115,7 +119,7 @@ let test_span_equal () =
   with_string_buffer "GET /path HTTP/1.1" (fun buf ->
     (* peek triggers refill *)
     ignore (peek buf 17);
-    let sp = { start = 0; len = 3 } in
+    let sp = #{ start = 0; len = 3 } in
     assert_true ~msg:"span_equal GET" (span_equal buf sp "GET");
     assert_true ~msg:"span_equal not POST" (not (span_equal buf sp "POST"));
     pass "span_equal")
@@ -124,7 +128,7 @@ let test_span_equal_caseless () =
   with_string_buffer "Content-Type: text/html" (fun buf ->
     (* peek triggers refill *)
     ignore (peek buf 22);
-    let name_span = { start = 0; len = 12 } in
+    let name_span = #{ start = 0; len = 12 } in
     assert_true ~msg:"caseless match" (span_equal_caseless buf name_span "content-type");
     assert_true ~msg:"caseless match 2" (span_equal_caseless buf name_span "CONTENT-TYPE");
     pass "span_equal_caseless")
@@ -137,7 +141,7 @@ let test_parse_simple_request () =
   with_string_buffer "GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n" (fun buf ->
     let req = parse_request buf in
     assert_true ~msg:"method is GET" (req.meth = GET);
-    assert_equal ~msg:"target" "/index.html" (span_to_string buf req.target);
+    assert_equal ~msg:"target" "/index.html" (span_to_string buf (request_target req));
     assert_true ~msg:"version is 1.1" (req.version = HTTP_1_1);
     assert_equal_int ~msg:"header count" 1 (Headers.count req.headers);
     assert_equal ~msg:"header value" "example.com"
@@ -153,7 +157,7 @@ let test_parse_request_with_body_headers () =
      \r\n" (fun buf ->
     let req = parse_request buf in
     assert_true ~msg:"method is POST" (req.meth = POST);
-    assert_equal ~msg:"target" "/api/data" (span_to_string buf req.target);
+    assert_equal ~msg:"target" "/api/data" (span_to_string buf (request_target req));
     assert_equal_int ~msg:"header count" 3 (Headers.count req.headers);
     (* Test header lookup *)
     (match get_header buf req "Content-Type" with
@@ -206,7 +210,7 @@ let test_parse_chunked_in_chunks () =
   ] (fun buf ->
     let req = parse_request buf in
     assert_true ~msg:"method is GET" (req.meth = GET);
-    assert_equal ~msg:"target" "/path" (span_to_string buf req.target);
+    assert_equal ~msg:"target" "/path" (span_to_string buf (request_target req));
     assert_equal_int ~msg:"header count" 1 (Headers.count req.headers);
     pass "parse_chunked_in_chunks")
 
@@ -243,7 +247,7 @@ let test_parse_simple_response () =
     let resp = parse_response buf in
     assert_true ~msg:"version is 1.1" (resp.version = HTTP_1_1);
     assert_equal_int ~msg:"status" 200 resp.status;
-    assert_equal ~msg:"reason" "OK" (span_to_string buf resp.reason);
+    assert_equal ~msg:"reason" "OK" (span_to_string buf (response_reason resp));
     assert_equal_int ~msg:"header count" 1 (Headers.count resp.headers);
     pass "parse_simple_response")
 
@@ -253,7 +257,7 @@ let test_parse_response_various_status () =
     with_string_buffer line (fun buf ->
       let resp = parse_response buf in
       assert_equal_int ~msg:("status " ^ string_of_int code) code resp.status;
-      assert_equal ~msg:("reason " ^ reason) reason (span_to_string buf resp.reason))
+      assert_equal ~msg:("reason " ^ reason) reason (span_to_string buf (response_reason resp)))
   in
   test_status 200 "OK";
   test_status 201 "Created";
@@ -349,7 +353,7 @@ let test_write_with_spans () =
 
     let dst = Bytes.create 256 in
     (* Create output using spans from parsed request *)
-    let target_out = out_span buf req.target in
+    let target_out = out_span buf (request_target req) in
     (* Iterate over headers to get name and value spans *)
     let host_header = ref None in
     Headers.iter (fun _name name_span value ->
@@ -410,8 +414,8 @@ let test_body_fixed_span () =
     let req = parse_request buf in
     let reader = body_reader_of_request buf req in
     (match body_read_span buf reader with
-     | Some sp ->
-       assert_equal ~msg:"span body" "hello" (span_to_string buf sp)
+     | Some bs ->
+       assert_equal ~msg:"span body" "hello" (span_to_string buf (unbox_span bs))
      | None -> assert false);
     pass "body_fixed_span")
 
@@ -454,7 +458,7 @@ let test_body_chunked_with_trailers () =
        assert_equal_int ~msg:"trailer count" 1 (Headers.count trailers);
        (* Look up the trailer by string name *)
        (match Headers.find_by_string buf.zb trailers "X-Checksum" with
-        | Some sp -> assert_equal ~msg:"trailer value" "abc123" (span_to_string buf sp)
+        | Some bs -> assert_equal ~msg:"trailer value" "abc123" (span_to_string buf (unbox_span bs))
         | None -> assert false)
      | None -> assert false);
     pass "body_chunked_with_trailers")
@@ -565,7 +569,7 @@ let test_span_across_fragments () =
     let req = parse_request buf in
     assert_equal ~msg:"target across fragments"
       "/very-long-path-that-spans-frags"
-      (span_to_string buf req.target);
+      (span_to_string buf (request_target req));
     pass "span_across_fragments")
 
 let test_header_value_across_fragments () =
@@ -613,7 +617,7 @@ let test_realistic_browser_request_fragmented () =
 
     (* Verify parsing is correct *)
     assert_true ~msg:"method is GET" (req.meth = GET);
-    assert_equal ~msg:"target" "/dune-project" (span_to_string buf req.target);
+    assert_equal ~msg:"target" "/dune-project" (span_to_string buf (request_target req));
     assert_true ~msg:"version is 1.1" (req.version = HTTP_1_1);
     assert_equal_int ~msg:"header count" 7 (Headers.count req.headers);
 
@@ -653,7 +657,7 @@ let test_tiny_fragments () =
     let req = parse_request buf in
 
     assert_true ~msg:"method is GET" (req.meth = GET);
-    assert_equal ~msg:"target" "/" (span_to_string buf req.target);
+    assert_equal ~msg:"target" "/" (span_to_string buf (request_target req));
     assert_equal_int ~msg:"header count" 1 (Headers.count req.headers);
     assert_equal ~msg:"Host value" "x"
       (match get_header buf req "Host" with Some v -> v | None -> "");

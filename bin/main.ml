@@ -132,7 +132,7 @@ let serve_file response_buf fd full_path =
 
 (* Handle a single request - req is already parsed *)
 let handle_request response_buf fd buf (req : Httpl.request) =
-  let target = Httpl.span_to_string buf req.target in
+  let target = Httpl.span_to_string buf (Httpl.request_target req) in
 
   (* Only handle GET and HEAD *)
   let is_get = match req.meth with
@@ -209,8 +209,9 @@ let string_of_sockaddr = function
 
 (* Log header details *)
 let log_headers client_str buf (req : Httpl.request) =
+  let target = Httpl.request_target req in
   Printf.eprintf "[%s]   target: span{start=%d, len=%d} = %S\n%!"
-    client_str req.target.start req.target.len (Httpl.span_to_string buf req.target);
+    client_str target.#start target.#len (Httpl.span_to_string buf target);
   Printf.eprintf "[%s]   headers (%d):\n%!" client_str (Httpl.Headers.count req.headers);
   let i = ref 0 in
   Httpl.Headers.iter (fun name name_span value ->
@@ -218,7 +219,7 @@ let log_headers client_str buf (req : Httpl.request) =
     let value_str = Httpl.span_to_string buf value in
     Printf.eprintf "[%s]     [%d] %S: %S\n%!" client_str !i name_str value_str;
     Printf.eprintf "[%s]         name_span{start=%d, len=%d} value_span{start=%d, len=%d}\n%!"
-      client_str name_span.start name_span.len value.start value.len;
+      client_str name_span.#start name_span.#len value.#start value.#len;
     incr i
   ) req.headers
 
@@ -231,9 +232,10 @@ let handle_connection fd client_addr =
   let eof = ref false in
   let bytes_read = ref 0 in
   let fragment_count = ref 0 in
+  (* Refill returns bool: true if data added, false for EOF *)
   let refill httpl_buf =
     if !eof then
-      Httpl.push httpl_buf Bytes.empty ~off:0 ~len:0  (* EOF marker *)
+      false  (* EOF *)
     else
       try
         (* Allocate fresh buffer for each read - zbuf keeps references (zero-copy) *)
@@ -242,7 +244,7 @@ let handle_connection fd client_addr =
         Printf.eprintf "[%s] Read %d bytes\n%!" client_str n;
         if n = 0 then begin
           eof := true;
-          Httpl.push httpl_buf Bytes.empty ~off:0 ~len:0  (* EOF marker *)
+          false  (* EOF *)
         end else begin
           incr fragment_count;
           bytes_read := !bytes_read + n;
@@ -254,17 +256,18 @@ let handle_connection fd client_addr =
           let preview = Bytes.sub_string data 0 preview_len in
           Printf.eprintf "[%s]   data preview: %S%s\n%!"
             client_str preview (if n > 80 then "..." else "");
-          Httpl.push httpl_buf data ~off:0 ~len:n
+          Httpl.push httpl_buf data ~off:0 ~len:n;
+          true  (* data added *)
         end
       with
       | Unix.Unix_error (Unix.ECONNRESET, _, _) ->
         Printf.eprintf "[%s] Connection reset\n%!" client_str;
         eof := true;
-        Httpl.push httpl_buf Bytes.empty ~off:0 ~len:0
+        false  (* EOF *)
       | Unix.Unix_error (err, _, _) ->
         Printf.eprintf "[%s] Read error: %s\n%!" client_str (Unix.error_message err);
         eof := true;
-        Httpl.push httpl_buf Bytes.empty ~off:0 ~len:0
+        false  (* EOF *)
   in
   let buf = Httpl.create () in
 
@@ -288,7 +291,7 @@ let handle_connection fd client_addr =
           ~body:(Some (Httpl.error_to_string err));
         ()
       | Ok req ->
-        let target = Httpl.span_to_string buf req.Httpl.target in
+        let target = Httpl.span_to_string buf (Httpl.request_target req) in
         let meth = match req.Httpl.meth with
           | Httpl.GET -> "GET" | Httpl.POST -> "POST" | Httpl.HEAD -> "HEAD"
           | Httpl.PUT -> "PUT" | Httpl.DELETE -> "DELETE" | _ -> "OTHER"
