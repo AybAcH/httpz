@@ -211,3 +211,5 @@ val status_to_string : status -> string
 val method_to_string : buffer -> method_ -> string
 val version_to_string : version -> string
 val header_name_to_string : buffer -> header_name -> string
+val header_name_lowercase : header_name -> string
+(** Lowercase canonical name for known headers. Returns [""] for [H_other]. *)

@@ -77,36 +77,39 @@ let[@inline always] is_token_char = function
 let[@inline always] is_space = function ' ' | '\t' -> true | _ -> false
 
 let[@inline always] to_lower c =
-  if Char.(>=) c 'A' && Char.(<=) c 'Z' then Char.of_int_exn (Char.to_int c + 32) else c
+  if Char.(>=) c 'A' && Char.(<=) c 'Z' then Char.unsafe_of_int (Char.to_int c + 32) else c
 
 (* Span operations - use Base_bigstring.memcmp_string for speed *)
-let span_equal buf (sp : span) s =
+let[@inline] span_equal buf (sp : span) s =
   let slen = String.length s in
   if sp.#len <> slen then false
   else Base_bigstring.memcmp_string buf ~pos1:sp.#off s ~pos2:0 ~len:slen = 0
 
-let span_equal_caseless buf (sp : span) s =
+let[@inline] span_equal_caseless buf (sp : span) s =
   let slen = String.length s in
   if sp.#len <> slen then false
   else begin
     let mutable i = 0 in
     let mutable equal = true in
+    let off = sp.#off in  (* Cache offset to avoid repeated unboxing *)
     while equal && i < slen do
-      if to_lower (peek buf (sp.#off + i)) <>. to_lower (String.get s i) then
+      if to_lower (peek buf (off + i)) <>. to_lower (String.unsafe_get s i) then
         equal <- false
       else i <- i + 1
     done;
     equal
   end
 
-let parse_int64 buf (sp : span) =
+let[@inline] parse_int64 buf (sp : span) =
   if sp.#len = 0 then -1L
   else begin
     let mutable acc = 0L in
     let mutable i = 0 in
     let mutable valid = true in
-    while valid && i < sp.#len do
-      let c = peek buf (sp.#off + i) in
+    let off = sp.#off in
+    let len = sp.#len in
+    while valid && i < len do
+      let c = peek buf (off + i) in
       if Char.(>=) c '0' && Char.(<=) c '9' then begin
         let digit = Int64.of_int (Char.to_int c - 48) in
         acc <- Int64.(+) (Int64.( * ) acc 10L) digit;
@@ -201,20 +204,14 @@ let parse_header_name buf (sp : span) : header_name =
     else H_other sp
   | _ -> H_other sp
 
-(* Boxed result types for internal parsing *)
-type method_result = { mr_meth : method_; mr_pos : int }
-type target_result = { tr_off : int; tr_len : int; tr_pos : int }
-type version_result = { vr_version : version; vr_pos : int }
-type header_result = { hr_hdr : header; hr_pos : int }
-
-(* Parse method *)
-let parse_method buf ~pos ~len : (method_result, status) result =
+(* Parse method - returns unboxed #(status * method_ * int) - no allocation *)
+let[@inline] parse_method buf ~pos ~len : #(status * method_ * int) =
   let mutable p = pos in
   while p < len && is_token_char (peek buf p) do
     p <- p + 1
   done;
   let meth_len = p - pos in
-  if meth_len = 0 then Error Invalid_method
+  if meth_len = 0 then #(Invalid_method, GET, 0)
   else
     let sp = #{ off = pos; len = meth_len } in
     let meth = match meth_len with
@@ -239,34 +236,34 @@ let parse_method buf ~pos ~len : (method_result, status) result =
         else Other sp
       | _ -> Other sp
     in
-    Result.Ok { mr_meth = meth; mr_pos = p }
+    #(Ok, meth, p)
 
-(* Parse request target *)
-let parse_target buf ~pos ~len : (target_result, status) result =
+(* Parse request target - returns unboxed #(status * int * int * int) *)
+let[@inline] parse_target buf ~pos ~len : #(status * int * int * int) =
   let mutable p = pos in
   while p < len && (let c = peek buf p in c <>. ' ' && c <>. '\r') do
     p <- p + 1
   done;
   let target_len = p - pos in
-  if target_len = 0 then Error Invalid_target
-  else Result.Ok { tr_off = pos; tr_len = target_len; tr_pos = p }
+  if target_len = 0 then #(Invalid_target, 0, 0, 0)
+  else #(Ok, pos, target_len, p)
 
-(* Parse HTTP version *)
-let parse_version buf ~pos ~len : (version_result, status) result =
-  if pos + 8 > len then Error Partial
+(* Parse HTTP version - returns unboxed #(status * version * int) *)
+let[@inline] parse_version buf ~pos ~len : #(status * version * int) =
+  if pos + 8 > len then #(Partial, HTTP_1_1, 0)
   else if peek buf pos =. 'H' && peek buf (pos+1) =. 'T' &&
           peek buf (pos+2) =. 'T' && peek buf (pos+3) =. 'P' &&
           peek buf (pos+4) =. '/' && peek buf (pos+5) =. '1' &&
           peek buf (pos+6) =. '.' then
     let minor = peek buf (pos+7) in
-    if minor =. '1' then Result.Ok { vr_version = HTTP_1_1; vr_pos = pos + 8 }
-    else if minor =. '0' then Result.Ok { vr_version = HTTP_1_0; vr_pos = pos + 8 }
-    else Error Invalid_version
-  else Error Invalid_version
+    if minor =. '1' then #(Ok, HTTP_1_1, pos + 8)
+    else if minor =. '0' then #(Ok, HTTP_1_0, pos + 8)
+    else #(Invalid_version, HTTP_1_1, 0)
+  else #(Invalid_version, HTTP_1_1, 0)
 
-(* Find CRLF from position - use Base_bigstring.unsafe_find for speed *)
+(* Find CRLF from position - returns position or -1 if not found (no allocation) *)
 let find_crlf buf ~pos ~len =
-  if len - pos < 2 then None
+  if len - pos < 2 then -1
   else begin
     let mutable p = pos in
     let mutable found = false in
@@ -284,11 +281,12 @@ let find_crlf buf ~pos ~len =
         p <- cr_pos + 1
       end
     done;
-    if found then Some p else None
+    if found then p else -1
   end
 
-(* Parse a single header *)
-let parse_header buf ~pos ~len : (header_result, status) result =
+(* Parse a single header - returns unboxed #(status * header_name * int * int * int) *)
+(* Fields: status, name, value_off, value_len, new_pos *)
+let[@inline] parse_header buf ~pos ~len : #(status * header_name * int * int * int) =
   (* Find colon *)
   let mutable colon_pos = pos in
   while colon_pos < len && is_token_char (peek buf colon_pos) do
@@ -296,7 +294,7 @@ let parse_header buf ~pos ~len : (header_result, status) result =
   done;
   let name_len = colon_pos - pos in
   if name_len = 0 || colon_pos >= len || peek buf colon_pos <>. ':' then
-    Error Invalid_header
+    #(Invalid_header, H_host, 0, 0, 0)  (* sentinel values *)
   else begin
     let name_span = #{ off = pos; len = name_len } in
     let name = parse_header_name buf name_span in
@@ -306,24 +304,25 @@ let parse_header buf ~pos ~len : (header_result, status) result =
       p <- p + 1
     done;
     let value_start = p in
-    (* Find end of value (CRLF) *)
-    match find_crlf buf ~pos:p ~len with
-    | None -> Error Partial
-    | Some crlf_pos ->
+    (* Find end of value (CRLF) - returns -1 if not found *)
+    let crlf_pos = find_crlf buf ~pos:p ~len in
+    if crlf_pos < 0 then #(Partial, H_host, 0, 0, 0)
+    else begin
       (* Trim trailing whitespace *)
       let mutable value_end = crlf_pos in
       while value_end > value_start && is_space (peek buf (value_end - 1)) do
         value_end <- value_end - 1
       done;
-      let value = #{ off = value_start; len = value_end - value_start } in
-      let hdr = { name; value } in
-      Result.Ok { hr_hdr = hdr; hr_pos = crlf_pos + 2 }
+      #(Ok, name, value_start, value_end - value_start, crlf_pos + 2)
+    end
   end
 
-(* Main parse function *)
+(* Main parse function - fully unboxed, no exceptions *)
 let parse buf ~len = exclave_
-  if len > buffer_size then
-    #(Headers_too_large, #{ meth = GET; target = #{ off = 0; len = 0 }; version = HTTP_1_1; body_off = 0 }, [])
+  let error_result status =
+    #(status, #{ meth = GET; target = #{ off = 0; len = 0 }; version = HTTP_1_1; body_off = 0 }, [])
+  in
+  if len > buffer_size then error_result Headers_too_large
   else
     let mutable pos = 0 in
     let mutable status = Ok in
@@ -334,51 +333,50 @@ let parse buf ~len = exclave_
     let mutable headers = [] in
     let mutable header_count = 0 in
     let mutable body_off = 0 in
-    let mutable done_ = false in
 
-    (* Parse method *)
-    if not done_ then begin
-      match parse_method buf ~pos ~len with
-      | Error e -> status <- e; done_ <- true
-      | Result.Ok r ->
-        meth <- r.mr_meth;
-        pos <- r.mr_pos;
-        (* Expect space *)
-        if pos >= len then begin status <- Partial; done_ <- true end
-        else if peek buf pos <>. ' ' then begin status <- Invalid_method; done_ <- true end
-        else pos <- pos + 1
+    (* Parse method - unboxed tuple return *)
+    let #(s, m, new_pos) = parse_method buf ~pos ~len in
+    if Poly.(<>) s Ok then status <- s
+    else begin
+      meth <- m;
+      pos <- new_pos;
+      (* Expect space *)
+      if pos >= len then status <- Partial
+      else if peek buf pos <>. ' ' then status <- Invalid_method
+      else pos <- pos + 1
     end;
 
-    (* Parse target *)
-    if not done_ then begin
-      match parse_target buf ~pos ~len with
-      | Error e -> status <- e; done_ <- true
-      | Result.Ok r ->
-        target_off <- r.tr_off;
-        target_len <- r.tr_len;
-        pos <- r.tr_pos;
+    (* Parse target - unboxed tuple return *)
+    if Poly.(=) status Ok then begin
+      let #(s, toff, tlen, new_pos) = parse_target buf ~pos ~len in
+      if Poly.(<>) s Ok then status <- s
+      else begin
+        target_off <- toff;
+        target_len <- tlen;
+        pos <- new_pos;
         (* Expect space *)
-        if pos >= len then begin status <- Partial; done_ <- true end
-        else if peek buf pos <>. ' ' then begin status <- Invalid_target; done_ <- true end
+        if pos >= len then status <- Partial
+        else if peek buf pos <>. ' ' then status <- Invalid_target
         else pos <- pos + 1
+      end
     end;
 
-    (* Parse version *)
-    if not done_ then begin
-      match parse_version buf ~pos ~len with
-      | Error e -> status <- e; done_ <- true
-      | Result.Ok r ->
-        version <- r.vr_version;
-        pos <- r.vr_pos;
+    (* Parse version - unboxed tuple return *)
+    if Poly.(=) status Ok then begin
+      let #(s, v, new_pos) = parse_version buf ~pos ~len in
+      if Poly.(<>) s Ok then status <- s
+      else begin
+        version <- v;
+        pos <- new_pos;
         (* Expect CRLF *)
-        if pos + 1 >= len then begin status <- Partial; done_ <- true end
-        else if peek buf pos <>. '\r' || peek buf (pos+1) <>. '\n' then begin
-          status <- Malformed; done_ <- true
-        end
+        if pos + 1 >= len then status <- Partial
+        else if peek buf pos <>. '\r' || peek buf (pos+1) <>. '\n' then status <- Malformed
         else pos <- pos + 2
+      end
     end;
 
     (* Parse headers *)
+    let mutable done_ = Poly.(<>) status Ok in
     while not done_ do
       (* Check for end of headers (empty line) *)
       if pos + 1 >= len then begin
@@ -390,21 +388,27 @@ let parse buf ~len = exclave_
       end else if header_count >= max_headers then begin
         status <- Headers_too_large; done_ <- true
       end else begin
-        match parse_header buf ~pos ~len with
-        | Error e -> status <- e; done_ <- true
-        | Result.Ok r ->
-          headers <- r.hr_hdr :: headers;
+        (* Unboxed tuple return *)
+        let #(s, name, voff, vlen, new_pos) = parse_header buf ~pos ~len in
+        if Poly.(<>) s Ok then begin
+          status <- s; done_ <- true
+        end else begin
+          let hdr = { name; value = #{ off = voff; len = vlen } } in
+          headers <- hdr :: headers;
           header_count <- header_count + 1;
-          pos <- r.hr_pos
+          pos <- new_pos
+        end
       end
     done;
 
-    (* Reverse headers to get correct order *)
-    let headers = List.rev headers in
-
-    let target = #{ off = target_off; len = target_len } in
-    let req = #{ meth; target; version; body_off } in
-    #(status, req, headers)
+    if Poly.(<>) status Ok then error_result status
+    else begin
+      (* Reverse headers to get correct order *)
+      let headers = List.rev headers in
+      let target = #{ off = target_off; len = target_len } in
+      let req = #{ meth; target; version; body_off } in
+      #(Ok, req, headers)
+    end
 
 (* Header utilities *)
 let rec find_header (headers @ local) name = exclave_
@@ -418,68 +422,64 @@ let rec find_header (headers @ local) name = exclave_
     in
     if matches then Some hdr else find_header rest name
 
+(* Canonical lowercase name for known headers *)
+let header_name_lowercase = function
+  | H_cache_control -> "cache-control"
+  | H_connection -> "connection"
+  | H_date -> "date"
+  | H_transfer_encoding -> "transfer-encoding"
+  | H_upgrade -> "upgrade"
+  | H_via -> "via"
+  | H_accept -> "accept"
+  | H_accept_charset -> "accept-charset"
+  | H_accept_encoding -> "accept-encoding"
+  | H_accept_language -> "accept-language"
+  | H_authorization -> "authorization"
+  | H_cookie -> "cookie"
+  | H_expect -> "expect"
+  | H_host -> "host"
+  | H_if_match -> "if-match"
+  | H_if_modified_since -> "if-modified-since"
+  | H_if_none_match -> "if-none-match"
+  | H_if_unmodified_since -> "if-unmodified-since"
+  | H_range -> "range"
+  | H_referer -> "referer"
+  | H_user_agent -> "user-agent"
+  | H_age -> "age"
+  | H_etag -> "etag"
+  | H_location -> "location"
+  | H_retry_after -> "retry-after"
+  | H_server -> "server"
+  | H_set_cookie -> "set-cookie"
+  | H_www_authenticate -> "www-authenticate"
+  | H_allow -> "allow"
+  | H_content_disposition -> "content-disposition"
+  | H_content_encoding -> "content-encoding"
+  | H_content_language -> "content-language"
+  | H_content_length -> "content-length"
+  | H_content_location -> "content-location"
+  | H_content_range -> "content-range"
+  | H_content_type -> "content-type"
+  | H_expires -> "expires"
+  | H_last_modified -> "last-modified"
+  | H_x_forwarded_for -> "x-forwarded-for"
+  | H_x_forwarded_proto -> "x-forwarded-proto"
+  | H_x_forwarded_host -> "x-forwarded-host"
+  | H_x_request_id -> "x-request-id"
+  | H_x_correlation_id -> "x-correlation-id"
+  | H_other _ -> ""
+
 let rec find_header_string buf (headers @ local) name = exclave_
   match headers with
   | [] -> None
   | hdr :: rest ->
-    let name_span = match hdr.name with
-      | H_other sp -> sp
-      | _ ->
-        (* Get canonical name and compare *)
-        let canonical = match hdr.name with
-          | H_cache_control -> "cache-control"
-          | H_connection -> "connection"
-          | H_date -> "date"
-          | H_transfer_encoding -> "transfer-encoding"
-          | H_upgrade -> "upgrade"
-          | H_via -> "via"
-          | H_accept -> "accept"
-          | H_accept_charset -> "accept-charset"
-          | H_accept_encoding -> "accept-encoding"
-          | H_accept_language -> "accept-language"
-          | H_authorization -> "authorization"
-          | H_cookie -> "cookie"
-          | H_expect -> "expect"
-          | H_host -> "host"
-          | H_if_match -> "if-match"
-          | H_if_modified_since -> "if-modified-since"
-          | H_if_none_match -> "if-none-match"
-          | H_if_unmodified_since -> "if-unmodified-since"
-          | H_range -> "range"
-          | H_referer -> "referer"
-          | H_user_agent -> "user-agent"
-          | H_age -> "age"
-          | H_etag -> "etag"
-          | H_location -> "location"
-          | H_retry_after -> "retry-after"
-          | H_server -> "server"
-          | H_set_cookie -> "set-cookie"
-          | H_www_authenticate -> "www-authenticate"
-          | H_allow -> "allow"
-          | H_content_disposition -> "content-disposition"
-          | H_content_encoding -> "content-encoding"
-          | H_content_language -> "content-language"
-          | H_content_length -> "content-length"
-          | H_content_location -> "content-location"
-          | H_content_range -> "content-range"
-          | H_content_type -> "content-type"
-          | H_expires -> "expires"
-          | H_last_modified -> "last-modified"
-          | H_x_forwarded_for -> "x-forwarded-for"
-          | H_x_forwarded_proto -> "x-forwarded-proto"
-          | H_x_forwarded_host -> "x-forwarded-host"
-          | H_x_request_id -> "x-request-id"
-          | H_x_correlation_id -> "x-correlation-id"
-          | H_other _ -> ""
-        in
-        if String.(=) (String.lowercase name) canonical then
-          #{ off = 0; len = -1 } (* Signal match *)
-        else
-          #{ off = 0; len = 0 } (* No match, continue *)
+    let matches = match hdr.name with
+      | H_other sp -> span_equal_caseless buf sp name
+      | known ->
+        let canonical = header_name_lowercase known in
+        String.(=) (String.lowercase name) canonical
     in
-    if name_span.#len = -1 then Some hdr
-    else if name_span.#len > 0 && span_equal_caseless buf name_span name then Some hdr
-    else find_header_string buf rest name
+    if matches then Some hdr else find_header_string buf rest name
 
 let content_length buf (headers @ local) =
   match find_header headers H_content_length with
