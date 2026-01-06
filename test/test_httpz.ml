@@ -17,14 +17,13 @@ let test_simple_get () =
   assert (Poly.(=) req.#meth Httpz.GET);
   assert (Httpz.span_equal buf req.#target "/index.html");
   assert (Poly.(=) req.#version Httpz.HTTP_1_1);
-  assert (List.length headers = 2);
-  (* Headers are returned in reverse order from the parser *)
+  (* Content-Length is now cached in request struct and excluded from headers *)
+  assert (Int64.(=) req.#content_length 0L);
+  assert (List.length headers = 1);
   (match headers with
-   | [hdr0; hdr1] ->
-     assert (Poly.(=) hdr0.name Httpz.H_content_length);
-     assert (Httpz.span_equal buf hdr0.value "0");
-     assert (Poly.(=) hdr1.name Httpz.H_host);
-     assert (Httpz.span_equal buf hdr1.value "example.com")
+   | [hdr0] ->
+     assert (Poly.(=) hdr0.name Httpz.H_host);
+     assert (Httpz.span_equal buf hdr0.value "example.com")
    | _ -> assert false);
   Stdio.printf "test_simple_get: PASSED\n"
 
@@ -37,10 +36,11 @@ let test_post_with_body () =
   assert (Poly.(=) req.#meth Httpz.POST);
   assert (Httpz.span_equal buf req.#target "/api/data");
   assert (Poly.(=) req.#version Httpz.HTTP_1_1);
-  assert (List.length headers = 3);
+  (* Content-Length excluded from headers, only Host and Content-Type remain *)
+  assert (List.length headers = 2);
   assert (req.#body_off = len - 13);
-  let cl = Httpz.content_length buf headers in
-  assert (Int64.(=) cl 13L);
+  (* Content-Length is now in the request struct *)
+  assert (Int64.(=) req.#content_length 13L);
   Stdio.printf "test_post_with_body: PASSED\n"
 
 let test_unknown_method () =
@@ -94,16 +94,17 @@ let test_keep_alive () =
   (* HTTP/1.1 default is keep-alive *)
   let request1 = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n" in
   let len1 = copy_to_buffer buf request1 in
-  let #(status1, req1, headers1) = Httpz.parse buf ~len:len1 in
+  let #(status1, req1, _headers1) = Httpz.parse buf ~len:len1 in
   assert (Poly.(=) status1 Httpz.Ok);
-  assert (Httpz.is_keep_alive buf headers1 req1.#version);
+  (* Use cached keep_alive from request struct *)
+  assert req1.#keep_alive;
 
   (* HTTP/1.0 default is close *)
   let request2 = "GET / HTTP/1.0\r\n\r\n" in
   let len2 = copy_to_buffer buf request2 in
-  let #(status2, req2, headers2) = Httpz.parse buf ~len:len2 in
+  let #(status2, req2, _headers2) = Httpz.parse buf ~len:len2 in
   assert (Poly.(=) status2 Httpz.Ok);
-  assert (not (Httpz.is_keep_alive buf headers2 req2.#version));
+  assert (not req2.#keep_alive);
 
   Stdio.printf "test_keep_alive: PASSED\n"
 
@@ -111,9 +112,12 @@ let test_chunked () =
   let buf = Httpz.create_buffer () in
   let request = "POST /upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n" in
   let len = copy_to_buffer buf request in
-  let #(status, _req, headers) = Httpz.parse buf ~len in
+  let #(status, req, headers) = Httpz.parse buf ~len in
   assert (Poly.(=) status Httpz.Ok);
-  assert (Httpz.is_chunked buf headers);
+  (* Transfer-Encoding is now cached in request struct and excluded from headers *)
+  assert req.#is_chunked;
+  (* Only Host header remains *)
+  assert (List.length headers = 1);
   Stdio.printf "test_chunked: PASSED\n"
 
 let test_find_header () =

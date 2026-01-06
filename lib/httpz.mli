@@ -12,15 +12,17 @@
       let #(status, req, headers) = Httpz.parse buf ~len in
       match status with
       | Ok ->
-        let target = req.#target in
+        (* Content headers are cached in the request struct *)
+        let content_len = req.#content_length in
+        let is_chunked = req.#is_chunked in
+        let keep_alive = req.#keep_alive in
+        (* Other headers are in the list *)
         List.iter (fun hdr ->
           match hdr.name with
-          | H_content_length ->
-            let n = Httpz.parse_int64 buf hdr.value in ...
           | H_host ->
             let host = hdr.value in ...
-          | H_other name_span ->
-            if Httpz.span_equal_caseless buf name_span "x-custom" then ...
+          | H_other ->
+            if Httpz.span_equal_caseless buf hdr.name_span "x-custom" then ...
           | _ -> ()
         ) headers
       | Partial -> need_more_data ()
@@ -79,8 +81,13 @@ type request = #{
   target : span;
   version : version;
   body_off : int;
+  content_length : int64;  (** Content-Length value, [-1L] if not present *)
+  is_chunked : bool;       (** [true] if Transfer-Encoding: chunked *)
+  keep_alive : bool;       (** [true] for keep-alive (considers version default) *)
 }
-(** Unboxed request record. *)
+(** Unboxed request record. Content headers (Content-Length, Transfer-Encoding,
+    Connection) are parsed during header parsing and cached here; they are
+    excluded from the returned header list. *)
 
 type status =
   | Ok
@@ -132,28 +139,22 @@ val find_header : header list @ local -> header_name -> header option @ local
 val find_header_string : buffer -> header list @ local -> string -> header option @ local
 (** Find header by string name (case-insensitive). *)
 
-val content_length : buffer -> header list @ local -> int64
-(** Get Content-Length or [-1L]. *)
-
-val is_chunked : buffer -> header list @ local -> bool
-(** Check Transfer-Encoding: chunked. *)
-
-val is_keep_alive : buffer -> header list @ local -> version -> bool
-(** Check Connection keep-alive. *)
-
 (** {1 Body Handling} *)
 
-val body_in_buffer : buffer -> len:int -> body_off:int -> header list @ local -> bool
+val body_in_buffer : len:int -> request @ local -> bool
 (** Check if the complete body is available in the buffer.
-    Returns [true] if body_off + content_length <= len, or if there's no body. *)
+    Returns [true] if body_off + content_length <= len, or if there's no body.
+    Uses cached content_length and is_chunked from request. *)
 
-val body_span : buffer -> len:int -> body_off:int -> header list @ local -> span
+val body_span : len:int -> request @ local -> span
 (** Get span of body if fully in buffer. Returns span with [len = -1] if body
-    incomplete or chunked encoding (use [parse_chunk] for chunked). *)
+    incomplete or chunked encoding (use [parse_chunk] for chunked).
+    Uses cached content_length and is_chunked from request. *)
 
-val body_bytes_needed : buffer -> len:int -> body_off:int -> header list @ local -> int
+val body_bytes_needed : len:int -> request @ local -> int
 (** Returns additional bytes needed for complete body, or [0] if complete.
-    Returns [-1] for chunked encoding (unknown length). *)
+    Returns [-1] for chunked encoding (unknown length).
+    Uses cached content_length and is_chunked from request. *)
 
 (** {2 Chunked Transfer Encoding} *)
 

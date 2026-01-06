@@ -4,7 +4,7 @@
 open Base
 
 let buffer_size = 32768
-let max_headers = 32  (* Reduced from 64 to lower init overhead *)
+let max_headers = 32
 
 type span = #{ off : int; len : int }
 
@@ -44,6 +44,9 @@ type request = #{
   target : span;
   version : version;
   body_off : int;
+  content_length : int64;  (** -1L if not present *)
+  is_chunked : bool;
+  keep_alive : bool;
 }
 
 type status =
@@ -56,18 +59,15 @@ type status =
   | Headers_too_large
   | Malformed
 
-(* Buffer type - same as Base_bigstring.t *)
 type buffer = Base_bigstring.t
 
 let create_buffer () =
   Base_bigstring.create buffer_size
 
-(* Buffer access - use Base_bigstring's optimized unsafe_get *)
 let[@inline always] peek buf pos =
   Base_bigstring.unsafe_get buf pos
 
-(* Character operations - use Poly for simple char comparisons *)
-let[@inline always] ( =. ) (a : char) (b : char) = Poly.(=) a b
+let[@inline always] ( =. ) (a : char) (b : char) = Char.equal a b
 let[@inline always] ( <>. ) (a : char) (b : char) = Poly.(<>) a b
 
 (* Character predicates *)
@@ -317,27 +317,53 @@ let[@inline] parse_header buf ~pos ~len : #(status * header_name * int * int * i
     end
   end
 
-(* Parse headers recursively - builds local list on stack *)
-let rec parse_headers_loop buf ~pos ~len ~count ~acc = exclave_
+(* Parse headers recursively - builds local list on stack
+   Tracks content headers (Content-Length, Transfer-Encoding, Connection) separately
+   and excludes them from the returned header list.
+   conn values: 0=not seen, 1=close, 2=keep-alive *)
+let rec parse_headers_loop buf ~pos ~len ~count ~acc ~content_len ~chunked ~conn = exclave_
   if pos + 1 >= len then
-    #(Partial, pos, 0, acc)
+    #(Partial, pos, 0, acc, content_len, chunked, conn)
   else if peek buf pos =. '\r' && peek buf (pos+1) =. '\n' then
     (* End of headers *)
-    #(Ok, pos + 2, count, acc)
+    #(Ok, pos + 2, count, acc, content_len, chunked, conn)
   else if count >= max_headers then
-    #(Headers_too_large, pos, count, acc)
+    #(Headers_too_large, pos, count, acc, content_len, chunked, conn)
   else
     let #(s, name, noff, nlen, voff, vlen, new_pos) = parse_header buf ~pos ~len in
     if Poly.(<>) s Ok then
-      #(s, pos, count, acc)
+      #(s, pos, count, acc, content_len, chunked, conn)
     else
-      let hdr = { name; name_span = #{ off = noff; len = nlen }; value = #{ off = voff; len = vlen } } in
-      parse_headers_loop buf ~pos:new_pos ~len ~count:(count + 1) ~acc:(hdr :: acc)
+      let value_span = #{ off = voff; len = vlen } in
+      (* Check for content headers and handle specially *)
+      match name with
+      | H_content_length ->
+        let cl = parse_int64 buf value_span in
+        parse_headers_loop buf ~pos:new_pos ~len ~count:(count + 1) ~acc
+          ~content_len:cl ~chunked ~conn
+      | H_transfer_encoding ->
+        let is_chunked = span_equal_caseless buf value_span "chunked" in
+        parse_headers_loop buf ~pos:new_pos ~len ~count:(count + 1) ~acc
+          ~content_len ~chunked:is_chunked ~conn
+      | H_connection ->
+        let new_conn =
+          if span_equal_caseless buf value_span "close" then 1
+          else if span_equal_caseless buf value_span "keep-alive" then 2
+          else conn
+        in
+        parse_headers_loop buf ~pos:new_pos ~len ~count:(count + 1) ~acc
+          ~content_len ~chunked ~conn:new_conn
+      | _ ->
+        (* Regular header - add to list *)
+        let hdr = { name; name_span = #{ off = noff; len = nlen }; value = value_span } in
+        parse_headers_loop buf ~pos:new_pos ~len ~count:(count + 1) ~acc:(hdr :: acc)
+          ~content_len ~chunked ~conn
 
 (* Main parse function - uses recursive local list building *)
 let parse buf ~len = exclave_
   let error_result status = exclave_
-    #(status, #{ meth = GET; target = #{ off = 0; len = 0 }; version = HTTP_1_1; body_off = 0 }, ([] : header list))
+    #(status, #{ meth = GET; target = #{ off = 0; len = 0 }; version = HTTP_1_1; body_off = 0;
+                 content_length = -1L; is_chunked = false; keep_alive = true }, ([] : header list))
   in
   if len > buffer_size then error_result Headers_too_large
   else
@@ -362,12 +388,22 @@ let parse buf ~len = exclave_
         else if peek buf pos <>. '\r' || peek buf (pos+1) <>. '\n' then error_result Malformed
         else
           let pos = pos + 2 in
-          (* Parse headers recursively - local list (reversed order) *)
-          let #(s, body_off, _count, headers) = parse_headers_loop buf ~pos ~len ~count:0 ~acc:[] in
+          (* Parse headers recursively - local list (reversed order)
+             Content headers are extracted and excluded from the list *)
+          let #(s, body_off, _count, headers, content_length, is_chunked, conn) =
+            parse_headers_loop buf ~pos ~len ~count:0 ~acc:[]
+              ~content_len:(-1L) ~chunked:false ~conn:0
+          in
           match s with
           | Ok ->
             let target = #{ off = target_off; len = target_len } in
-            let req = #{ meth; target; version; body_off } in
+            (* Compute keep_alive: conn=0 uses version default, 1=close, 2=keep-alive *)
+            let keep_alive = match conn with
+              | 1 -> false
+              | 2 -> true
+              | _ -> Poly.(=) version HTTP_1_1
+            in
+            let req = #{ meth; target; version; body_off; content_length; is_chunked; keep_alive } in
             #(Ok, req, headers)
           | err -> error_result err
 
@@ -439,24 +475,6 @@ let rec find_header_string buf (headers : header list @ local) name = exclave_
         String.(=) (String.lowercase name) canonical
     in
     if matches then Some hdr else find_header_string buf rest name
-
-let content_length buf (headers : header list @ local) =
-  match find_header headers H_content_length with
-  | None -> -1L
-  | Some hdr -> parse_int64 buf hdr.value
-
-let is_chunked buf (headers : header list @ local) =
-  match find_header headers H_transfer_encoding with
-  | None -> false
-  | Some hdr -> span_equal_caseless buf hdr.value "chunked"
-
-let is_keep_alive buf (headers : header list @ local) version =
-  match find_header headers H_connection with
-  | None -> Poly.(=) version HTTP_1_1
-  | Some hdr ->
-    if span_equal_caseless buf hdr.value "close" then false
-    else if span_equal_caseless buf hdr.value "keep-alive" then true
-    else Poly.(=) version HTTP_1_1
 
 (* Debug functions *)
 let status_to_string = function
@@ -531,35 +549,35 @@ let header_name_to_string _buf = function
   | H_x_correlation_id -> "X-Correlation-Id"
   | H_other -> "(unknown)"
 
-(* Body handling *)
-let body_in_buffer buf ~len ~body_off (headers : header list @ local) =
-  if is_chunked buf headers then false
+(* Body handling - use cached values from request struct *)
+let body_in_buffer ~len (req : request @ local) =
+  if req.#is_chunked then false
   else
-    let cl = content_length buf headers in
+    let cl = req.#content_length in
     if Int64.(<=) cl 0L then true
     else
-      let body_end = body_off + Int64.to_int_exn cl in
+      let body_end = req.#body_off + Int64.to_int_exn cl in
       body_end <= len
 
-let body_span buf ~len ~body_off (headers : header list @ local) =
-  if is_chunked buf headers then #{ off = 0; len = -1 }
+let body_span ~len (req : request @ local) =
+  if req.#is_chunked then #{ off = 0; len = -1 }
   else
-    let cl = content_length buf headers in
-    if Int64.(<=) cl 0L then #{ off = body_off; len = 0 }
+    let cl = req.#content_length in
+    if Int64.(<=) cl 0L then #{ off = req.#body_off; len = 0 }
     else
       let body_len = Int64.to_int_exn cl in
-      let body_end = body_off + body_len in
-      if body_end <= len then #{ off = body_off; len = body_len }
+      let body_end = req.#body_off + body_len in
+      if body_end <= len then #{ off = req.#body_off; len = body_len }
       else #{ off = 0; len = -1 }
 
-let body_bytes_needed buf ~len ~body_off (headers : header list @ local) =
-  if is_chunked buf headers then -1
+let body_bytes_needed ~len (req : request @ local) =
+  if req.#is_chunked then -1
   else
-    let cl = content_length buf headers in
+    let cl = req.#content_length in
     if Int64.(<=) cl 0L then 0
     else
       let body_len = Int64.to_int_exn cl in
-      let body_end = body_off + body_len in
+      let body_end = req.#body_off + body_len in
       if body_end <= len then 0
       else body_end - len
 

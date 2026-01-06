@@ -588,12 +588,14 @@ let httpz_header_benchmarks =
       ignore (Httpz.find_header headers Httpz.H_host));
 
     Bench.Test.create ~name:"httpz_parse_and_is_keepalive" (fun () ->
-      let #(_status, req, headers) = Httpz.parse buf ~len in
-      ignore (Httpz.is_keep_alive buf headers req.#version));
+      let #(_status, req, _headers) = Httpz.parse buf ~len in
+      (* Now using cached keep_alive from request struct *)
+      ignore req.#keep_alive);
 
     Bench.Test.create ~name:"httpz_parse_and_content_length" (fun () ->
-      let #(_status, _req, headers) = Httpz.parse buf ~len in
-      ignore (Httpz.content_length buf headers));
+      let #(_status, req, _headers) = Httpz.parse buf ~len in
+      (* Now using cached content_length from request struct *)
+      ignore req.#content_length);
   ]
 
 (* Httpz body handling benchmarks *)
@@ -602,20 +604,20 @@ let httpz_body_benchmarks =
   [
     Bench.Test.create ~name:"httpz_body_100B" (fun () ->
       let len = copy_to_httpz_buffer buf request_body_100 in
-      let #(_status, req, headers) = Httpz.parse buf ~len in
-      let body = Httpz.body_span buf ~len ~body_off:req.#body_off headers in
+      let #(_status, req, _headers) = Httpz.parse buf ~len in
+      let body = Httpz.body_span ~len req in
       ignore body.#len);
 
     Bench.Test.create ~name:"httpz_body_1KB" (fun () ->
       let len = copy_to_httpz_buffer buf request_body_1k in
-      let #(_status, req, headers) = Httpz.parse buf ~len in
-      let body = Httpz.body_span buf ~len ~body_off:req.#body_off headers in
+      let #(_status, req, _headers) = Httpz.parse buf ~len in
+      let body = Httpz.body_span ~len req in
       ignore body.#len);
 
     Bench.Test.create ~name:"httpz_body_10KB" (fun () ->
       let len = copy_to_httpz_buffer buf request_body_10k in
-      let #(_status, req, headers) = Httpz.parse buf ~len in
-      let body = Httpz.body_span buf ~len ~body_off:req.#body_off headers in
+      let #(_status, req, _headers) = Httpz.parse buf ~len in
+      let body = Httpz.body_span ~len req in
       ignore body.#len);
   ]
 

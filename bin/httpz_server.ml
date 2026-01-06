@@ -153,16 +153,16 @@ let handle_request conn ~routes =
   let target = req.#target in
   match status with
   | Httpz.Ok ->
-    (* Check if body is complete *)
-    let body_span = Httpz.body_span buf ~len ~body_off headers in
+    (* Check if body is complete - use cached content headers from req *)
+    let body_span = Httpz.body_span ~len req in
     let body_span_len = body_span.#len in
     let body_span_off = body_span.#off in
     if body_span_len = -1 then begin
       (* Need more data for body *)
       `Need_more
     end else begin
-      (* Determine keep-alive *)
-      conn.keep_alive <- Httpz.is_keep_alive buf headers version;
+      (* Use cached keep-alive from request *)
+      conn.keep_alive <- req.#keep_alive;
       (* Create body span - use extracted int values which are global *)
       let body_span_rec : Httpz.span = #{ off = body_span_off; len = body_span_len } in
       (* Route and handle - all data stays local until handler extracts what it needs *)
