@@ -7,14 +7,16 @@ open Core_bench
 
 let minimal_request = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
 
-let simple_request = {|GET /path/to/resource HTTP/1.1
+let simple_request =
+  {|GET /path/to/resource HTTP/1.1
 Host: example.com
 User-Agent: Mozilla/5.0
 Accept: text/html
 Connection: keep-alive
 
 |}
-|> String.substr_replace_all ~pattern:"\n" ~with_:"\r\n"
+  |> String.substr_replace_all ~pattern:"\n" ~with_:"\r\n"
+;;
 
 let make_request_with_headers n_headers =
   let buf = Buffer.create 1024 in
@@ -25,6 +27,7 @@ let make_request_with_headers n_headers =
   done;
   Buffer.add_string buf "\r\n";
   Buffer.contents buf
+;;
 
 let request_5_headers = make_request_with_headers 5
 let request_10_headers = make_request_with_headers 10
@@ -33,8 +36,16 @@ let request_50_headers = make_request_with_headers 50
 
 let make_request_with_body body_size =
   let body = String.make body_size 'x' in
-  Printf.sprintf "POST /upload HTTP/1.1\r\nHost: example.com\r\nContent-Length: %d\r\nContent-Type: application/octet-stream\r\n\r\n%s"
-    body_size body
+  Printf.sprintf
+    "POST /upload HTTP/1.1\r\n\
+     Host: example.com\r\n\
+     Content-Length: %d\r\n\
+     Content-Type: application/octet-stream\r\n\
+     \r\n\
+     %s"
+    body_size
+    body
+;;
 
 let request_body_100 = make_request_with_body 100
 let request_body_1k = make_request_with_body 1024
@@ -54,7 +65,8 @@ If-None-Match: "abc123"
 If-Modified-Since: Mon, 01 Jan 2024 00:00:00 GMT
 
 |}
-|> String.substr_replace_all ~pattern:"\n" ~with_:"\r\n"
+  |> String.substr_replace_all ~pattern:"\n" ~with_:"\r\n"
+;;
 
 (* Benchmark helpers *)
 
@@ -65,6 +77,7 @@ let copy_to_httpz_buffer buf data =
     Bigarray.Array1.set buf i (String.get data i)
   done;
   len
+;;
 
 (* Parse request using httpz - note: result is stack-allocated (local) *)
 let parse_request_httpz buf data =
@@ -74,6 +87,7 @@ let parse_request_httpz buf data =
   let _ = req.#body_off in
   let _ = headers in
   status
+;;
 
 (* Variant to test if List.length causes allocation *)
 let parse_request_httpz_with_length buf data =
@@ -82,11 +96,13 @@ let parse_request_httpz_with_length buf data =
   let _ = req.#body_off in
   let _ = List.length headers in
   status
+;;
 
 (* Test just the copy - no parsing *)
 let just_copy_httpz buf data =
   let len = copy_to_httpz_buffer buf data in
   len
+;;
 
 (* Test parse only - assume data already in buffer *)
 let just_parse_httpz buf len =
@@ -94,6 +110,7 @@ let just_parse_httpz buf len =
   let _ = req.#body_off in
   let _ = headers in
   status
+;;
 
 (* Httpz parsing benchmarks *)
 let httpz_buf = Httpz.create_buffer ()
@@ -104,132 +121,118 @@ let () =
   for i = 0 to minimal_len - 1 do
     Bigarray.Array1.set httpz_buf i (String.get minimal_request i)
   done
+;;
 
-let httpz_parsing_benchmarks = [
-  Bench.Test.create ~name:"httpz_noop" (fun () ->
-    ());
-
-  Bench.Test.create ~name:"httpz_just_copy" (fun () ->
-    ignore (just_copy_httpz httpz_buf minimal_request));
-
-  Bench.Test.create ~name:"httpz_just_parse" (fun () ->
-    ignore (just_parse_httpz httpz_buf minimal_len));
-
-  Bench.Test.create ~name:"httpz_minimal" (fun () ->
-    ignore (parse_request_httpz httpz_buf minimal_request));
-
-  Bench.Test.create ~name:"httpz_minimal_len" (fun () ->
-    ignore (parse_request_httpz_with_length httpz_buf minimal_request));
-
-  Bench.Test.create ~name:"httpz_simple" (fun () ->
-    ignore (parse_request_httpz httpz_buf simple_request));
-
-  Bench.Test.create ~name:"httpz_browser" (fun () ->
-    ignore (parse_request_httpz httpz_buf browser_request));
-
-  Bench.Test.create ~name:"httpz_browser_len" (fun () ->
-    ignore (parse_request_httpz_with_length httpz_buf browser_request));
-
-  Bench.Test.create ~name:"httpz_5_headers" (fun () ->
-    ignore (parse_request_httpz httpz_buf request_5_headers));
-
-  Bench.Test.create ~name:"httpz_10_headers" (fun () ->
-    ignore (parse_request_httpz httpz_buf request_10_headers));
-
-  Bench.Test.create ~name:"httpz_20_headers" (fun () ->
-    ignore (parse_request_httpz httpz_buf request_20_headers));
-
-  Bench.Test.create ~name:"httpz_50_headers" (fun () ->
-    ignore (parse_request_httpz httpz_buf request_50_headers));
-]
+let httpz_parsing_benchmarks =
+  [ Bench.Test.create ~name:"httpz_noop" (fun () -> ())
+  ; Bench.Test.create ~name:"httpz_just_copy" (fun () ->
+      ignore (just_copy_httpz httpz_buf minimal_request))
+  ; Bench.Test.create ~name:"httpz_just_parse" (fun () ->
+      ignore (just_parse_httpz httpz_buf minimal_len))
+  ; Bench.Test.create ~name:"httpz_minimal" (fun () ->
+      ignore (parse_request_httpz httpz_buf minimal_request))
+  ; Bench.Test.create ~name:"httpz_minimal_len" (fun () ->
+      ignore (parse_request_httpz_with_length httpz_buf minimal_request))
+  ; Bench.Test.create ~name:"httpz_simple" (fun () ->
+      ignore (parse_request_httpz httpz_buf simple_request))
+  ; Bench.Test.create ~name:"httpz_browser" (fun () ->
+      ignore (parse_request_httpz httpz_buf browser_request))
+  ; Bench.Test.create ~name:"httpz_browser_len" (fun () ->
+      ignore (parse_request_httpz_with_length httpz_buf browser_request))
+  ; Bench.Test.create ~name:"httpz_5_headers" (fun () ->
+      ignore (parse_request_httpz httpz_buf request_5_headers))
+  ; Bench.Test.create ~name:"httpz_10_headers" (fun () ->
+      ignore (parse_request_httpz httpz_buf request_10_headers))
+  ; Bench.Test.create ~name:"httpz_20_headers" (fun () ->
+      ignore (parse_request_httpz httpz_buf request_20_headers))
+  ; Bench.Test.create ~name:"httpz_50_headers" (fun () ->
+      ignore (parse_request_httpz httpz_buf request_50_headers))
+  ]
+;;
 
 (* Httpz header lookup benchmarks *)
 let httpz_header_benchmarks =
   let buf = Httpz.create_buffer () in
   let len = copy_to_httpz_buffer buf browser_request in
-  [
-    Bench.Test.create ~name:"httpz_parse_and_find_host" (fun () ->
+  [ Bench.Test.create ~name:"httpz_parse_and_find_host" (fun () ->
       let #(_status, _req, headers) = Httpz.parse buf ~len in
-      ignore (Httpz.find_header headers Httpz.H_host));
-
-    Bench.Test.create ~name:"httpz_parse_and_is_keepalive" (fun () ->
+      ignore (Httpz.find_header headers Httpz.H_host))
+  ; Bench.Test.create ~name:"httpz_parse_and_is_keepalive" (fun () ->
       let #(_status, req, _headers) = Httpz.parse buf ~len in
       (* Now using cached keep_alive from request struct *)
-      ignore req.#keep_alive);
-
-    Bench.Test.create ~name:"httpz_parse_and_content_length" (fun () ->
+      ignore req.#keep_alive)
+  ; Bench.Test.create ~name:"httpz_parse_and_content_length" (fun () ->
       let #(_status, req, _headers) = Httpz.parse buf ~len in
       (* Now using cached content_length from request struct *)
-      ignore req.#content_length);
+      ignore req.#content_length)
   ]
+;;
 
 (* Httpz body handling benchmarks *)
 let httpz_body_benchmarks =
   let buf = Httpz.create_buffer () in
-  [
-    Bench.Test.create ~name:"httpz_body_100B" (fun () ->
+  [ Bench.Test.create ~name:"httpz_body_100B" (fun () ->
       let len = copy_to_httpz_buffer buf request_body_100 in
       let #(_status, req, _headers) = Httpz.parse buf ~len in
       let body = Httpz.body_span ~len req in
-      ignore body.#len);
-
-    Bench.Test.create ~name:"httpz_body_1KB" (fun () ->
+      ignore body.#len)
+  ; Bench.Test.create ~name:"httpz_body_1KB" (fun () ->
       let len = copy_to_httpz_buffer buf request_body_1k in
       let #(_status, req, _headers) = Httpz.parse buf ~len in
       let body = Httpz.body_span ~len req in
-      ignore body.#len);
-
-    Bench.Test.create ~name:"httpz_body_10KB" (fun () ->
+      ignore body.#len)
+  ; Bench.Test.create ~name:"httpz_body_10KB" (fun () ->
       let len = copy_to_httpz_buffer buf request_body_10k in
       let #(_status, req, _headers) = Httpz.parse buf ~len in
       let body = Httpz.body_span ~len req in
-      ignore body.#len);
+      ignore body.#len)
   ]
+;;
 
 (* Httpz response serialization benchmarks *)
 let httpz_serialize_benchmarks =
   let response_buf = Bytes.create 4096 in
-  [
-    Bench.Test.create ~name:"httpz_write_status_line" (fun () ->
-      ignore (Httpz.write_status_line response_buf ~off:0 Httpz.S200_OK Httpz.HTTP_1_1));
-
-    Bench.Test.create ~name:"httpz_write_response_headers" (fun () ->
-      let off = Httpz.write_status_line response_buf ~off:0 Httpz.S200_OK Httpz.HTTP_1_1 in
+  [ Bench.Test.create ~name:"httpz_write_status_line" (fun () ->
+      ignore (Httpz.write_status_line response_buf ~off:0 Httpz.S200_OK Httpz.HTTP_1_1))
+  ; Bench.Test.create ~name:"httpz_write_response_headers" (fun () ->
+      let off =
+        Httpz.write_status_line response_buf ~off:0 Httpz.S200_OK Httpz.HTTP_1_1
+      in
       let off = Httpz.write_header response_buf ~off "Content-Type" "application/json" in
       let off = Httpz.write_content_length response_buf ~off 1024 in
       let off = Httpz.write_connection response_buf ~off true in
       let off = Httpz.write_crlf response_buf ~off in
-      ignore off);
+      ignore off)
   ]
+;;
 
 (* Httpz throughput benchmarks *)
 let httpz_throughput_benchmarks =
   let buf = Httpz.create_buffer () in
   let iterations = 1000 in
-  [
-    Bench.Test.create ~name:"httpz_1k_simple" (fun () ->
+  [ Bench.Test.create ~name:"httpz_1k_simple" (fun () ->
       for _ = 1 to iterations do
         ignore (parse_request_httpz buf simple_request)
-      done);
-
-    Bench.Test.create ~name:"httpz_1k_browser" (fun () ->
+      done)
+  ; Bench.Test.create ~name:"httpz_1k_browser" (fun () ->
       for _ = 1 to iterations do
         ignore (parse_request_httpz buf browser_request)
-      done);
-
-    Bench.Test.create ~name:"httpz_1k_50headers" (fun () ->
+      done)
+  ; Bench.Test.create ~name:"httpz_1k_50headers" (fun () ->
       for _ = 1 to iterations do
         ignore (parse_request_httpz buf request_50_headers)
-      done);
+      done)
   ]
+;;
 
 let command =
-  Bench.make_command [
-    Bench.Test.create_group ~name:"httpz_parsing" httpz_parsing_benchmarks;
-    Bench.Test.create_group ~name:"httpz_headers" httpz_header_benchmarks;
-    Bench.Test.create_group ~name:"httpz_body" httpz_body_benchmarks;
-    Bench.Test.create_group ~name:"httpz_serialize" httpz_serialize_benchmarks;
-    Bench.Test.create_group ~name:"httpz_throughput" httpz_throughput_benchmarks;
-  ]
+  Bench.make_command
+    [ Bench.Test.create_group ~name:"httpz_parsing" httpz_parsing_benchmarks
+    ; Bench.Test.create_group ~name:"httpz_headers" httpz_header_benchmarks
+    ; Bench.Test.create_group ~name:"httpz_body" httpz_body_benchmarks
+    ; Bench.Test.create_group ~name:"httpz_serialize" httpz_serialize_benchmarks
+    ; Bench.Test.create_group ~name:"httpz_throughput" httpz_throughput_benchmarks
+    ]
+;;
 
 let () = Command_unix.run command

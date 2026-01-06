@@ -1,5 +1,5 @@
 (library
  (name httpz)
- (public_name httpl.httpz)
+ (public_name httpz)
  (modules httpz)
  (libraries base base_bigstring))
