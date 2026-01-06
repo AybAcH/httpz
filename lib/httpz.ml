@@ -94,7 +94,7 @@ let[@inline] span_equal_caseless buf (sp : span) s =
   else begin
     let mutable i = 0 in
     let mutable equal = true in
-    let off = sp.#off in  (* Cache offset to avoid repeated unboxing *)
+    let off = sp.#off in
     while equal && i < slen do
       if to_lower (peek buf (off + i)) <>. to_lower (String.unsafe_get s i) then
         equal <- false
@@ -129,7 +129,7 @@ let span_to_string buf (sp : span) =
 let span_to_bytes buf (sp : span) =
   Base_bigstring.To_bytes.sub buf ~pos:sp.#off ~len:sp.#len
 
-(* Parse header name from span *)
+(* Parse header name from span. TODO avsm replace with a DFA *)
 let parse_header_name buf (sp : span) : header_name =
   match sp.#len with
   | 3 ->
@@ -207,7 +207,6 @@ let parse_header_name buf (sp : span) : header_name =
     else H_other
   | _ -> H_other
 
-(* Parse method - returns unboxed #(status * method_ * int) - no allocation *)
 let[@inline] parse_method buf ~pos ~len : #(status * method_ * int) =
   let mutable p = pos in
   while p < len && is_token_char (peek buf p) do
@@ -241,7 +240,6 @@ let[@inline] parse_method buf ~pos ~len : #(status * method_ * int) =
     in
     #(Ok, meth, p)
 
-(* Parse request target - returns unboxed #(status * int * int * int) *)
 let[@inline] parse_target buf ~pos ~len : #(status * int * int * int) =
   let mutable p = pos in
   while p < len && (let c = peek buf p in c <>. ' ' && c <>. '\r') do
@@ -251,7 +249,6 @@ let[@inline] parse_target buf ~pos ~len : #(status * int * int * int) =
   if target_len = 0 then #(Invalid_target, 0, 0, 0)
   else #(Ok, pos, target_len, p)
 
-(* Parse HTTP version - returns unboxed #(status * version * int) *)
 let[@inline] parse_version buf ~pos ~len : #(status * version * int) =
   if pos + 8 > len then #(Partial, HTTP_1_1, 0)
   else if peek buf pos =. 'H' && peek buf (pos+1) =. 'T' &&
@@ -289,8 +286,6 @@ let find_crlf buf ~pos ~len =
     if found then p else -1
   end
 
-(* Parse a single header - returns unboxed tuple *)
-(* Fields: status, name, name_off, name_len, value_off, value_len, new_pos *)
 let[@inline] parse_header buf ~pos ~len : #(status * header_name * int * int * int * int * int) =
   (* Find colon *)
   let mutable colon_pos = pos in
@@ -299,7 +294,7 @@ let[@inline] parse_header buf ~pos ~len : #(status * header_name * int * int * i
   done;
   let name_len = colon_pos - pos in
   if name_len = 0 || colon_pos >= len || peek buf colon_pos <>. ':' then
-    #(Invalid_header, H_host, 0, 0, 0, 0, 0)  (* sentinel values *)
+    #(Invalid_header, H_host, 0, 0, 0, 0, 0)
   else begin
     let name_span = #{ off = pos; len = name_len } in
     let name = parse_header_name buf name_span in
@@ -376,9 +371,6 @@ let parse buf ~len = exclave_
             #(Ok, req, headers)
           | err -> error_result err
 
-(* Header utilities - work with local list *)
-(* Note: find_header only matches known headers, not H_other.
-   For unknown headers, use find_header_string. *)
 let rec find_header (headers : header list @ local) name = exclave_
   match headers with
   | [] -> None
