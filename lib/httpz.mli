@@ -62,13 +62,17 @@ type header_name =
   | H_expires | H_last_modified
   | H_x_forwarded_for | H_x_forwarded_proto | H_x_forwarded_host
   | H_x_request_id | H_x_correlation_id
-  | H_other of span
+  | H_other
+(** Header name. [H_other] indicates an unknown header; the actual name
+    is stored in the header's [name_span] field. *)
 
 type header = {
   name : header_name;
+  name_span : span;
   value : span;
 }
-(** Parsed header. Stack-allocated when returned in list. *)
+(** Parsed header. Stored in local list - stack allocated, no heap allocation.
+    [name_span] is only meaningful when [name = H_other]. *)
 
 type request = #{
   meth : method_;
@@ -100,7 +104,7 @@ val create_buffer : unit -> buffer
 
 val parse : buffer -> len:int -> #(status * request * header list) @ local
 (** Parse HTTP/1.1 request. Returns unboxed tuple on caller's stack.
-    Use Base.List functions (which support local) to process headers. *)
+    Headers stored in local list - stack allocated, grows as needed. *)
 
 (** {1 Span Operations} *)
 
@@ -122,7 +126,8 @@ val span_to_bytes : buffer -> span -> bytes
 (** {1 Header Utilities} *)
 
 val find_header : header list @ local -> header_name -> header option @ local
-(** Find first header by name. *)
+(** Find first header by name.
+    Only matches known headers; use [find_header_string] for [H_other]. *)
 
 val find_header_string : buffer -> header list @ local -> string -> header option @ local
 (** Find header by string name (case-insensitive). *)

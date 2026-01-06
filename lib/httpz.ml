@@ -4,7 +4,7 @@
 open Base
 
 let buffer_size = 32768
-let max_headers = 128
+let max_headers = 32  (* Reduced from 64 to lower init overhead *)
 
 type span = #{ off : int; len : int }
 
@@ -29,10 +29,13 @@ type header_name =
   | H_expires | H_last_modified
   | H_x_forwarded_for | H_x_forwarded_proto | H_x_forwarded_host
   | H_x_request_id | H_x_correlation_id
-  | H_other of span
+  | H_other  (* No payload - name_span in header record holds the span *)
 
+(* Boxed header for local list storage.
+   name_span is only valid when name = H_other *)
 type header = {
   name : header_name;
+  name_span : span;
   value : span;
 }
 
@@ -132,77 +135,77 @@ let parse_header_name buf (sp : span) : header_name =
   | 3 ->
     if span_equal_caseless buf sp "age" then H_age
     else if span_equal_caseless buf sp "via" then H_via
-    else H_other sp
+    else H_other
   | 4 ->
     if span_equal_caseless buf sp "date" then H_date
     else if span_equal_caseless buf sp "etag" then H_etag
     else if span_equal_caseless buf sp "host" then H_host
-    else H_other sp
+    else H_other
   | 5 ->
     if span_equal_caseless buf sp "allow" then H_allow
     else if span_equal_caseless buf sp "range" then H_range
-    else H_other sp
+    else H_other
   | 6 ->
     if span_equal_caseless buf sp "accept" then H_accept
     else if span_equal_caseless buf sp "cookie" then H_cookie
     else if span_equal_caseless buf sp "expect" then H_expect
     else if span_equal_caseless buf sp "server" then H_server
-    else H_other sp
+    else H_other
   | 7 ->
     if span_equal_caseless buf sp "expires" then H_expires
     else if span_equal_caseless buf sp "referer" then H_referer
     else if span_equal_caseless buf sp "upgrade" then H_upgrade
-    else H_other sp
+    else H_other
   | 8 ->
     if span_equal_caseless buf sp "if-match" then H_if_match
     else if span_equal_caseless buf sp "location" then H_location
-    else H_other sp
+    else H_other
   | 10 ->
     if span_equal_caseless buf sp "connection" then H_connection
     else if span_equal_caseless buf sp "set-cookie" then H_set_cookie
     else if span_equal_caseless buf sp "user-agent" then H_user_agent
-    else H_other sp
+    else H_other
   | 11 ->
     if span_equal_caseless buf sp "retry-after" then H_retry_after
-    else H_other sp
+    else H_other
   | 12 ->
     if span_equal_caseless buf sp "content-type" then H_content_type
     else if span_equal_caseless buf sp "x-request-id" then H_x_request_id
-    else H_other sp
+    else H_other
   | 13 ->
     if span_equal_caseless buf sp "authorization" then H_authorization
     else if span_equal_caseless buf sp "cache-control" then H_cache_control
     else if span_equal_caseless buf sp "content-range" then H_content_range
     else if span_equal_caseless buf sp "if-none-match" then H_if_none_match
     else if span_equal_caseless buf sp "last-modified" then H_last_modified
-    else H_other sp
+    else H_other
   | 14 ->
     if span_equal_caseless buf sp "accept-charset" then H_accept_charset
     else if span_equal_caseless buf sp "content-length" then H_content_length
-    else H_other sp
+    else H_other
   | 15 ->
     if span_equal_caseless buf sp "accept-encoding" then H_accept_encoding
     else if span_equal_caseless buf sp "accept-language" then H_accept_language
     else if span_equal_caseless buf sp "x-forwarded-for" then H_x_forwarded_for
     else if span_equal_caseless buf sp "x-correlation-id" then H_x_correlation_id
-    else H_other sp
+    else H_other
   | 16 ->
     if span_equal_caseless buf sp "content-encoding" then H_content_encoding
     else if span_equal_caseless buf sp "content-language" then H_content_language
     else if span_equal_caseless buf sp "content-location" then H_content_location
     else if span_equal_caseless buf sp "www-authenticate" then H_www_authenticate
     else if span_equal_caseless buf sp "x-forwarded-host" then H_x_forwarded_host
-    else H_other sp
+    else H_other
   | 17 ->
     if span_equal_caseless buf sp "if-modified-since" then H_if_modified_since
     else if span_equal_caseless buf sp "transfer-encoding" then H_transfer_encoding
     else if span_equal_caseless buf sp "x-forwarded-proto" then H_x_forwarded_proto
-    else H_other sp
+    else H_other
   | 19 ->
     if span_equal_caseless buf sp "content-disposition" then H_content_disposition
     else if span_equal_caseless buf sp "if-unmodified-since" then H_if_unmodified_since
-    else H_other sp
-  | _ -> H_other sp
+    else H_other
+  | _ -> H_other
 
 (* Parse method - returns unboxed #(status * method_ * int) - no allocation *)
 let[@inline] parse_method buf ~pos ~len : #(status * method_ * int) =
@@ -284,9 +287,9 @@ let find_crlf buf ~pos ~len =
     if found then p else -1
   end
 
-(* Parse a single header - returns unboxed #(status * header_name * int * int * int) *)
-(* Fields: status, name, value_off, value_len, new_pos *)
-let[@inline] parse_header buf ~pos ~len : #(status * header_name * int * int * int) =
+(* Parse a single header - returns unboxed tuple *)
+(* Fields: status, name, name_off, name_len, value_off, value_len, new_pos *)
+let[@inline] parse_header buf ~pos ~len : #(status * header_name * int * int * int * int * int) =
   (* Find colon *)
   let mutable colon_pos = pos in
   while colon_pos < len && is_token_char (peek buf colon_pos) do
@@ -294,7 +297,7 @@ let[@inline] parse_header buf ~pos ~len : #(status * header_name * int * int * i
   done;
   let name_len = colon_pos - pos in
   if name_len = 0 || colon_pos >= len || peek buf colon_pos <>. ':' then
-    #(Invalid_header, H_host, 0, 0, 0)  (* sentinel values *)
+    #(Invalid_header, H_host, 0, 0, 0, 0, 0)  (* sentinel values *)
   else begin
     let name_span = #{ off = pos; len = name_len } in
     let name = parse_header_name buf name_span in
@@ -306,118 +309,80 @@ let[@inline] parse_header buf ~pos ~len : #(status * header_name * int * int * i
     let value_start = p in
     (* Find end of value (CRLF) - returns -1 if not found *)
     let crlf_pos = find_crlf buf ~pos:p ~len in
-    if crlf_pos < 0 then #(Partial, H_host, 0, 0, 0)
+    if crlf_pos < 0 then #(Partial, H_host, 0, 0, 0, 0, 0)
     else begin
       (* Trim trailing whitespace *)
       let mutable value_end = crlf_pos in
       while value_end > value_start && is_space (peek buf (value_end - 1)) do
         value_end <- value_end - 1
       done;
-      #(Ok, name, value_start, value_end - value_start, crlf_pos + 2)
+      #(Ok, name, pos, name_len, value_start, value_end - value_start, crlf_pos + 2)
     end
   end
 
-(* Main parse function - fully unboxed, no exceptions *)
+(* Parse headers recursively - builds local list on stack *)
+let rec parse_headers_loop buf ~pos ~len ~count ~acc = exclave_
+  if pos + 1 >= len then
+    #(Partial, pos, 0, acc)
+  else if peek buf pos =. '\r' && peek buf (pos+1) =. '\n' then
+    (* End of headers *)
+    #(Ok, pos + 2, count, acc)
+  else if count >= max_headers then
+    #(Headers_too_large, pos, count, acc)
+  else
+    let #(s, name, noff, nlen, voff, vlen, new_pos) = parse_header buf ~pos ~len in
+    if Poly.(<>) s Ok then
+      #(s, pos, count, acc)
+    else
+      let hdr = { name; name_span = #{ off = noff; len = nlen }; value = #{ off = voff; len = vlen } } in
+      parse_headers_loop buf ~pos:new_pos ~len ~count:(count + 1) ~acc:(hdr :: acc)
+
+(* Main parse function - uses recursive local list building *)
 let parse buf ~len = exclave_
-  let error_result status =
-    #(status, #{ meth = GET; target = #{ off = 0; len = 0 }; version = HTTP_1_1; body_off = 0 }, [])
+  let error_result status = exclave_
+    #(status, #{ meth = GET; target = #{ off = 0; len = 0 }; version = HTTP_1_1; body_off = 0 }, ([] : header list))
   in
   if len > buffer_size then error_result Headers_too_large
   else
-    let mutable pos = 0 in
-    let mutable status = Ok in
-    let mutable meth = GET in
-    let mutable target_off = 0 in
-    let mutable target_len = 0 in
-    let mutable version = HTTP_1_1 in
-    let mutable headers = [] in
-    let mutable header_count = 0 in
-    let mutable body_off = 0 in
+    (* Parse method *)
+    let #(s, meth, pos) = parse_method buf ~pos:0 ~len in
+    if Poly.(<>) s Ok then error_result s
+    else if pos >= len then error_result Partial
+    else if peek buf pos <>. ' ' then error_result Invalid_method
+    else
+      let pos = pos + 1 in
+      (* Parse target *)
+      let #(s, target_off, target_len, pos) = parse_target buf ~pos ~len in
+      if Poly.(<>) s Ok then error_result s
+      else if pos >= len then error_result Partial
+      else if peek buf pos <>. ' ' then error_result Invalid_target
+      else
+        let pos = pos + 1 in
+        (* Parse version *)
+        let #(s, version, pos) = parse_version buf ~pos ~len in
+        if Poly.(<>) s Ok then error_result s
+        else if pos + 1 >= len then error_result Partial
+        else if peek buf pos <>. '\r' || peek buf (pos+1) <>. '\n' then error_result Malformed
+        else
+          let pos = pos + 2 in
+          (* Parse headers recursively - local list (reversed order) *)
+          let #(s, body_off, _count, headers) = parse_headers_loop buf ~pos ~len ~count:0 ~acc:[] in
+          match s with
+          | Ok ->
+            let target = #{ off = target_off; len = target_len } in
+            let req = #{ meth; target; version; body_off } in
+            #(Ok, req, headers)
+          | err -> error_result err
 
-    (* Parse method - unboxed tuple return *)
-    let #(s, m, new_pos) = parse_method buf ~pos ~len in
-    if Poly.(<>) s Ok then status <- s
-    else begin
-      meth <- m;
-      pos <- new_pos;
-      (* Expect space *)
-      if pos >= len then status <- Partial
-      else if peek buf pos <>. ' ' then status <- Invalid_method
-      else pos <- pos + 1
-    end;
-
-    (* Parse target - unboxed tuple return *)
-    if Poly.(=) status Ok then begin
-      let #(s, toff, tlen, new_pos) = parse_target buf ~pos ~len in
-      if Poly.(<>) s Ok then status <- s
-      else begin
-        target_off <- toff;
-        target_len <- tlen;
-        pos <- new_pos;
-        (* Expect space *)
-        if pos >= len then status <- Partial
-        else if peek buf pos <>. ' ' then status <- Invalid_target
-        else pos <- pos + 1
-      end
-    end;
-
-    (* Parse version - unboxed tuple return *)
-    if Poly.(=) status Ok then begin
-      let #(s, v, new_pos) = parse_version buf ~pos ~len in
-      if Poly.(<>) s Ok then status <- s
-      else begin
-        version <- v;
-        pos <- new_pos;
-        (* Expect CRLF *)
-        if pos + 1 >= len then status <- Partial
-        else if peek buf pos <>. '\r' || peek buf (pos+1) <>. '\n' then status <- Malformed
-        else pos <- pos + 2
-      end
-    end;
-
-    (* Parse headers *)
-    let mutable done_ = Poly.(<>) status Ok in
-    while not done_ do
-      (* Check for end of headers (empty line) *)
-      if pos + 1 >= len then begin
-        status <- Partial; done_ <- true
-      end else if peek buf pos =. '\r' && peek buf (pos+1) =. '\n' then begin
-        (* End of headers *)
-        body_off <- pos + 2;
-        done_ <- true
-      end else if header_count >= max_headers then begin
-        status <- Headers_too_large; done_ <- true
-      end else begin
-        (* Unboxed tuple return *)
-        let #(s, name, voff, vlen, new_pos) = parse_header buf ~pos ~len in
-        if Poly.(<>) s Ok then begin
-          status <- s; done_ <- true
-        end else begin
-          let hdr = { name; value = #{ off = voff; len = vlen } } in
-          headers <- hdr :: headers;
-          header_count <- header_count + 1;
-          pos <- new_pos
-        end
-      end
-    done;
-
-    if Poly.(<>) status Ok then error_result status
-    else begin
-      (* Reverse headers to get correct order *)
-      let headers = List.rev headers in
-      let target = #{ off = target_off; len = target_len } in
-      let req = #{ meth; target; version; body_off } in
-      #(Ok, req, headers)
-    end
-
-(* Header utilities *)
-let rec find_header (headers @ local) name = exclave_
+(* Header utilities - work with local list *)
+(* Note: find_header only matches known headers, not H_other.
+   For unknown headers, use find_header_string. *)
+let rec find_header (headers : header list @ local) name = exclave_
   match headers with
   | [] -> None
   | hdr :: rest ->
     let matches = match name, hdr.name with
-      | H_other sp1, H_other sp2 -> sp1.#off = sp2.#off && sp1.#len = sp2.#len
-      | H_other _, _ | _, H_other _ -> false
+      | H_other, _ | _, H_other -> false  (* Use find_header_string for unknown headers *)
       | n1, n2 -> Poly.(=) n1 n2
     in
     if matches then Some hdr else find_header rest name
@@ -467,31 +432,31 @@ let header_name_lowercase = function
   | H_x_forwarded_host -> "x-forwarded-host"
   | H_x_request_id -> "x-request-id"
   | H_x_correlation_id -> "x-correlation-id"
-  | H_other _ -> ""
+  | H_other -> ""
 
-let rec find_header_string buf (headers @ local) name = exclave_
+let rec find_header_string buf (headers : header list @ local) name = exclave_
   match headers with
   | [] -> None
   | hdr :: rest ->
     let matches = match hdr.name with
-      | H_other sp -> span_equal_caseless buf sp name
+      | H_other -> span_equal_caseless buf hdr.name_span name
       | known ->
         let canonical = header_name_lowercase known in
         String.(=) (String.lowercase name) canonical
     in
     if matches then Some hdr else find_header_string buf rest name
 
-let content_length buf (headers @ local) =
+let content_length buf (headers : header list @ local) =
   match find_header headers H_content_length with
   | None -> -1L
   | Some hdr -> parse_int64 buf hdr.value
 
-let is_chunked buf (headers @ local) =
+let is_chunked buf (headers : header list @ local) =
   match find_header headers H_transfer_encoding with
   | None -> false
   | Some hdr -> span_equal_caseless buf hdr.value "chunked"
 
-let is_keep_alive buf (headers @ local) version =
+let is_keep_alive buf (headers : header list @ local) version =
   match find_header headers H_connection with
   | None -> Poly.(=) version HTTP_1_1
   | Some hdr ->
@@ -526,7 +491,7 @@ let version_to_string = function
   | HTTP_1_0 -> "HTTP/1.0"
   | HTTP_1_1 -> "HTTP/1.1"
 
-let header_name_to_string buf = function
+let header_name_to_string _buf = function
   | H_cache_control -> "Cache-Control"
   | H_connection -> "Connection"
   | H_date -> "Date"
@@ -570,10 +535,10 @@ let header_name_to_string buf = function
   | H_x_forwarded_host -> "X-Forwarded-Host"
   | H_x_request_id -> "X-Request-Id"
   | H_x_correlation_id -> "X-Correlation-Id"
-  | H_other sp -> span_to_string buf sp
+  | H_other -> "(unknown)"
 
 (* Body handling *)
-let body_in_buffer buf ~len ~body_off (headers @ local) =
+let body_in_buffer buf ~len ~body_off (headers : header list @ local) =
   if is_chunked buf headers then false
   else
     let cl = content_length buf headers in
@@ -582,7 +547,7 @@ let body_in_buffer buf ~len ~body_off (headers @ local) =
       let body_end = body_off + Int64.to_int_exn cl in
       body_end <= len
 
-let body_span buf ~len ~body_off (headers @ local) =
+let body_span buf ~len ~body_off (headers : header list @ local) =
   if is_chunked buf headers then #{ off = 0; len = -1 }
   else
     let cl = content_length buf headers in
@@ -593,7 +558,7 @@ let body_span buf ~len ~body_off (headers @ local) =
       if body_end <= len then #{ off = body_off; len = body_len }
       else #{ off = 0; len = -1 }
 
-let body_bytes_needed buf ~len ~body_off (headers @ local) =
+let body_bytes_needed buf ~len ~body_off (headers : header list @ local) =
   if is_chunked buf headers then -1
   else
     let cl = content_length buf headers in

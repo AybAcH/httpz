@@ -506,7 +506,7 @@ let parse_request_httpz buf data =
   let #(status, req, headers) = Httpz.parse buf ~len in
   (* Extract values to prevent them from being optimized away *)
   let _ = req.#body_off in
-  let _ = Base.List.length headers in
+  let _ = List.length headers in
   status
 
 (* Httpz parsing benchmarks *)
