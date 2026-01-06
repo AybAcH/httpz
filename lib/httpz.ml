@@ -1,4 +1,5 @@
-(* httpz.ml - Stack-allocated HTTP/1.1 parser for OxCaml *)
+(* httpz.ml - Stack-allocated HTTP/1.1 parser for OxCaml
+   Using Base_bigstring for optimized operations *)
 
 open Base
 
@@ -52,15 +53,15 @@ type status =
   | Headers_too_large
   | Malformed
 
-type buffer =
-  (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
+(* Buffer type - same as Base_bigstring.t *)
+type buffer = Base_bigstring.t
 
 let create_buffer () =
-  Bigarray.Array1.create Bigarray.char Bigarray.c_layout buffer_size
+  Base_bigstring.create buffer_size
 
-(* Buffer access *)
+(* Buffer access - use Base_bigstring's optimized unsafe_get *)
 let[@inline always] peek buf pos =
-  Bigarray.Array1.unsafe_get buf pos
+  Base_bigstring.unsafe_get buf pos
 
 (* Character operations - use Poly for simple char comparisons *)
 let[@inline always] ( =. ) (a : char) (b : char) = Poly.(=) a b
@@ -78,19 +79,11 @@ let[@inline always] is_space = function ' ' | '\t' -> true | _ -> false
 let[@inline always] to_lower c =
   if Char.(>=) c 'A' && Char.(<=) c 'Z' then Char.of_int_exn (Char.to_int c + 32) else c
 
-(* Span operations *)
+(* Span operations - use Base_bigstring.memcmp_string for speed *)
 let span_equal buf (sp : span) s =
   let slen = String.length s in
   if sp.#len <> slen then false
-  else begin
-    let mutable i = 0 in
-    let mutable equal = true in
-    while equal && i < slen do
-      if peek buf (sp.#off + i) <>. String.get s i then equal <- false
-      else i <- i + 1
-    done;
-    equal
-  end
+  else Base_bigstring.memcmp_string buf ~pos1:sp.#off s ~pos2:0 ~len:slen = 0
 
 let span_equal_caseless buf (sp : span) s =
   let slen = String.length s in
@@ -125,18 +118,10 @@ let parse_int64 buf (sp : span) =
   end
 
 let span_to_string buf (sp : span) =
-  let s = Bytes.create sp.#len in
-  for i = 0 to sp.#len - 1 do
-    Bytes.unsafe_set s i (peek buf (sp.#off + i))
-  done;
-  Bytes.unsafe_to_string ~no_mutation_while_string_reachable:s
+  Base_bigstring.To_string.sub buf ~pos:sp.#off ~len:sp.#len
 
 let span_to_bytes buf (sp : span) =
-  let s = Bytes.create sp.#len in
-  for i = 0 to sp.#len - 1 do
-    Bytes.unsafe_set s i (peek buf (sp.#off + i))
-  done;
-  s
+  Base_bigstring.To_bytes.sub buf ~pos:sp.#off ~len:sp.#len
 
 (* Parse header name from span *)
 let parse_header_name buf (sp : span) : header_name =
@@ -279,15 +264,28 @@ let parse_version buf ~pos ~len : (version_result, status) result =
     else Error Invalid_version
   else Error Invalid_version
 
-(* Find CRLF from position *)
+(* Find CRLF from position - use Base_bigstring.unsafe_find for speed *)
 let find_crlf buf ~pos ~len =
-  let mutable p = pos in
-  let mutable found = false in
-  while not found && p + 1 < len do
-    if peek buf p =. '\r' && peek buf (p+1) =. '\n' then found <- true
-    else p <- p + 1
-  done;
-  if found then Some p else None
+  if len - pos < 2 then None
+  else begin
+    let mutable p = pos in
+    let mutable found = false in
+    while not found && p + 1 < len do
+      (* Use unsafe_find to jump to next '\r' *)
+      let cr_pos = Base_bigstring.unsafe_find buf '\r' ~pos:p ~len:(len - p) in
+      if cr_pos >= len - 1 then begin
+        (* No '\r' found, or found at very end with no room for '\n' *)
+        p <- len;
+      end else if Base_bigstring.unsafe_get buf (cr_pos + 1) =. '\n' then begin
+        p <- cr_pos;
+        found <- true
+      end else begin
+        (* '\r' not followed by '\n', continue searching after it *)
+        p <- cr_pos + 1
+      end
+    done;
+    if found then Some p else None
+  end
 
 (* Parse a single header *)
 let parse_header buf ~pos ~len : (header_result, status) result =

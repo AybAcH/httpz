@@ -24,4 +24,4 @@
  (name httpz)
  (public_name httpl.httpz)
  (modules httpz)
- (libraries base))
+ (libraries base base_bigstring))
