@@ -2,4 +2,4 @@
  (name httpz_server)
  (public_name httpz_server)
  (package httpl)
- (libraries httpz core core_unix))
+ (libraries httpz core core_unix async async_unix))

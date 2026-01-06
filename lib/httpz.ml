@@ -766,3 +766,85 @@ let write_content_length dst ~off len =
 let write_connection dst ~off keep_alive =
   if keep_alive then write_header dst ~off "Connection" "keep-alive"
   else write_header dst ~off "Connection" "close"
+
+(* Bigstring write functions - write directly to bigarray buffer without copying *)
+
+(* Write string to bigstring at offset, return new offset *)
+let[@inline] write_string_at_bigstring dst off s =
+  let len = String.length s in
+  for i = 0 to len - 1 do
+    Bigarray.Array1.unsafe_set dst (off + i) (String.unsafe_get s i)
+  done;
+  off + len
+
+(* Write integer to bigstring at offset, return new offset *)
+let write_int_at_bigstring dst off n =
+  if n = 0 then begin
+    Bigarray.Array1.unsafe_set dst off '0';
+    off + 1
+  end else begin
+    (* Count digits *)
+    let mutable temp = n in
+    let mutable digits = 0 in
+    while temp > 0 do
+      digits <- digits + 1;
+      temp <- temp / 10
+    done;
+    (* Write digits right-to-left *)
+    let mutable p = off + digits - 1 in
+    let mutable remaining = n in
+    while remaining > 0 do
+      Bigarray.Array1.unsafe_set dst p (Char.of_int_exn (48 + Int.rem remaining 10));
+      remaining <- remaining / 10;
+      p <- p - 1
+    done;
+    off + digits
+  end
+
+let write_status_line_bigstring dst ~off status version =
+  (* HTTP/1.x *)
+  let off = write_string_at_bigstring dst off (version_to_string version) in
+  Bigarray.Array1.unsafe_set dst off ' ';
+  let off = off + 1 in
+  (* Status code *)
+  let off = write_int_at_bigstring dst off (response_status_code status) in
+  Bigarray.Array1.unsafe_set dst off ' ';
+  let off = off + 1 in
+  (* Reason phrase *)
+  let off = write_string_at_bigstring dst off (response_status_reason status) in
+  (* CRLF *)
+  Bigarray.Array1.unsafe_set dst off '\r';
+  Bigarray.Array1.unsafe_set dst (off+1) '\n';
+  off + 2
+
+let write_header_bigstring dst ~off name value =
+  let off = write_string_at_bigstring dst off name in
+  Bigarray.Array1.unsafe_set dst off ':';
+  Bigarray.Array1.unsafe_set dst (off+1) ' ';
+  let off = off + 2 in
+  let off = write_string_at_bigstring dst off value in
+  Bigarray.Array1.unsafe_set dst off '\r';
+  Bigarray.Array1.unsafe_set dst (off+1) '\n';
+  off + 2
+
+let write_header_int_bigstring dst ~off name value =
+  let off = write_string_at_bigstring dst off name in
+  Bigarray.Array1.unsafe_set dst off ':';
+  Bigarray.Array1.unsafe_set dst (off+1) ' ';
+  let off = off + 2 in
+  let off = write_int_at_bigstring dst off value in
+  Bigarray.Array1.unsafe_set dst off '\r';
+  Bigarray.Array1.unsafe_set dst (off+1) '\n';
+  off + 2
+
+let write_crlf_bigstring dst ~off =
+  Bigarray.Array1.unsafe_set dst off '\r';
+  Bigarray.Array1.unsafe_set dst (off+1) '\n';
+  off + 2
+
+let write_content_length_bigstring dst ~off len =
+  write_header_int_bigstring dst ~off "Content-Length" len
+
+let write_connection_bigstring dst ~off keep_alive =
+  if keep_alive then write_header_bigstring dst ~off "Connection" "keep-alive"
+  else write_header_bigstring dst ~off "Connection" "close"

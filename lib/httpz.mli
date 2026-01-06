@@ -211,6 +211,31 @@ val write_connection : bytes -> off:int -> bool -> int
 (** Write "Connection: keep-alive\\r\\n" or "Connection: close\\r\\n".
     [true] for keep-alive. Returns new offset. *)
 
+(** {1 Bigstring Response Writing}
+
+    These functions write directly to bigarray buffers, avoiding copies
+    when used with Async's [Writer.write_bigstring]. *)
+
+val write_status_line_bigstring : buffer -> off:int -> response_status -> version -> int
+(** Write "HTTP/1.x CODE Reason\\r\\n" to bigstring at offset.
+    Returns new offset. *)
+
+val write_header_bigstring : buffer -> off:int -> string -> string -> int
+(** Write "Name: Value\\r\\n" to bigstring at offset. Returns new offset. *)
+
+val write_header_int_bigstring : buffer -> off:int -> string -> int -> int
+(** Write header with integer value to bigstring. Returns new offset. *)
+
+val write_crlf_bigstring : buffer -> off:int -> int
+(** Write "\\r\\n" to bigstring. Returns new offset. *)
+
+val write_content_length_bigstring : buffer -> off:int -> int -> int
+(** Write "Content-Length: N\\r\\n" to bigstring. Returns new offset. *)
+
+val write_connection_bigstring : buffer -> off:int -> bool -> int
+(** Write "Connection: keep-alive\\r\\n" or "Connection: close\\r\\n" to bigstring.
+    [true] for keep-alive. Returns new offset. *)
+
 (** {1 Debug} *)
 
 val status_to_string : status -> string
