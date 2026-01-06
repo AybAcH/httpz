@@ -1,17 +1,4 @@
 (executable
- (name main)
- (public_name eewwu)
- (package httpl)
- (libraries httpl unix threads magic-mime))
-
-(executable
- (name httpox)
- (public_name httpox)
- (package httpl)
- (libraries httpl core core_unix core_unix.command_unix threads magic-mime)
- (preprocess (pps ppx_jane)))
-
-(executable
  (name httpz_server)
  (public_name httpz_server)
  (package httpl)

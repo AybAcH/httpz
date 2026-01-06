@@ -1,26 +1,4 @@
 (library
- (name httpl)
- (public_name httpl)
- (modules httpl)
- (libraries zbuf))
-
-(library
- (name zbuf)
- (public_name httpl.zbuf)
- (modules zbuf))
-
-(library
- (name httplo)
- (public_name httpl.httplo)
- (modules httplo)
- (libraries zbufo))
-
-(library
- (name zbufo)
- (public_name httpl.zbufo)
- (modules zbufo))
-
-(library
  (name httpz)
  (public_name httpl.httpz)
  (modules httpz)
