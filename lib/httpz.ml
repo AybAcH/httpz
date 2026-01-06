@@ -272,9 +272,11 @@ let find_crlf buf ~pos ~len =
     let mutable found = false in
     while not found && p + 1 < len do
       (* Use unsafe_find to jump to next '\r' *)
-      let cr_pos = Base_bigstring.unsafe_find buf '\r' ~pos:p ~len:(len - p) in
-      if cr_pos >= len - 1 then begin
-        (* No '\r' found, or found at very end with no room for '\n' *)
+      let search_pos = p in
+      let search_len = len - p in
+      let cr_pos = Base_bigstring.unsafe_find buf '\r' ~pos:search_pos ~len:search_len in
+      if cr_pos < 0 || cr_pos >= len - 1 then begin
+        (* No '\r' found (returns -1), or found at very end with no room for '\n' *)
         p <- len;
       end else if Base_bigstring.unsafe_get buf (cr_pos + 1) =. '\n' then begin
         p <- cr_pos;

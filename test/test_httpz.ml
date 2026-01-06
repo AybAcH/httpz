@@ -18,12 +18,13 @@ let test_simple_get () =
   assert (Httpz.span_equal buf req.#target "/index.html");
   assert (Poly.(=) req.#version Httpz.HTTP_1_1);
   assert (List.length headers = 2);
+  (* Headers are returned in reverse order from the parser *)
   (match headers with
    | [hdr0; hdr1] ->
-     assert (Poly.(=) hdr0.name Httpz.H_host);
-     assert (Httpz.span_equal buf hdr0.value "example.com");
-     assert (Poly.(=) hdr1.name Httpz.H_content_length);
-     assert (Httpz.span_equal buf hdr1.value "0")
+     assert (Poly.(=) hdr0.name Httpz.H_content_length);
+     assert (Httpz.span_equal buf hdr0.value "0");
+     assert (Poly.(=) hdr1.name Httpz.H_host);
+     assert (Httpz.span_equal buf hdr1.value "example.com")
    | _ -> assert false);
   Stdio.printf "test_simple_get: PASSED\n"
 
@@ -60,12 +61,13 @@ let test_unknown_header () =
   let #(status, _req, headers) = Httpz.parse buf ~len in
   assert (Poly.(=) status Httpz.Ok);
   assert (List.length headers = 2);
+  (* Headers are returned in reverse order: X-Custom-Header is first, Host is second *)
   (match headers with
-   | [_; hdr1] ->
-     (match hdr1.name with
-      | Httpz.H_other sp -> assert (Httpz.span_equal_caseless buf sp "x-custom-header")
+   | [hdr0; _] ->
+     (match hdr0.name with
+      | Httpz.H_other -> assert (Httpz.span_equal_caseless buf hdr0.name_span "x-custom-header")
       | _ -> assert false);
-     assert (Httpz.span_equal buf hdr1.value "custom-value")
+     assert (Httpz.span_equal buf hdr0.value "custom-value")
    | _ -> assert false);
   Stdio.printf "test_unknown_header: PASSED\n"
 
