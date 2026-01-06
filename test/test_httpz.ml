@@ -8,12 +8,19 @@ let copy_to_buffer buf s =
   done;
   len
 
+(* Helper to parse a request and assert success.
+   Returns the unboxed triple directly - caller must destructure immediately *)
+let parse_ok buf request = exclave_
+  let len = copy_to_buffer buf request in
+  let #(status, req, headers) = Httpz.parse buf ~len in
+  if Poly.(<>) status Httpz.Ok then
+    failwith (Printf.sprintf "Expected Ok, got %s" (Httpz.status_to_string status));
+  #(len, req, headers)
+
 let test_simple_get () =
   let buf = Httpz.create_buffer () in
   let request = "GET /index.html HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n" in
-  let len = copy_to_buffer buf request in
-  let #(status, req, headers) = Httpz.parse buf ~len in
-  assert (Poly.(=) status Httpz.Ok);
+  let #(_len, req, headers) = parse_ok buf request in
   assert (Poly.(=) req.#meth Httpz.GET);
   assert (Httpz.span_equal buf req.#target "/index.html");
   assert (Poly.(=) req.#version Httpz.HTTP_1_1);
@@ -30,9 +37,7 @@ let test_simple_get () =
 let test_post_with_body () =
   let buf = Httpz.create_buffer () in
   let request = "POST /api/data HTTP/1.1\r\nHost: api.example.com\r\nContent-Type: application/json\r\nContent-Length: 13\r\n\r\n{\"key\":\"val\"}" in
-  let len = copy_to_buffer buf request in
-  let #(status, req, headers) = Httpz.parse buf ~len in
-  assert (Poly.(=) status Httpz.Ok);
+  let #(len, req, headers) = parse_ok buf request in
   assert (Poly.(=) req.#meth Httpz.POST);
   assert (Httpz.span_equal buf req.#target "/api/data");
   assert (Poly.(=) req.#version Httpz.HTTP_1_1);
@@ -46,9 +51,7 @@ let test_post_with_body () =
 let test_unknown_method () =
   let buf = Httpz.create_buffer () in
   let request = "PURGE /cache HTTP/1.1\r\nHost: cdn.example.com\r\n\r\n" in
-  let len = copy_to_buffer buf request in
-  let #(status, req, _headers) = Httpz.parse buf ~len in
-  assert (Poly.(=) status Httpz.Ok);
+  let #(_len, req, _headers) = parse_ok buf request in
   (match req.#meth with
    | Httpz.Other sp -> assert (Httpz.span_equal buf sp "PURGE")
    | _ -> assert false);
@@ -57,9 +60,7 @@ let test_unknown_method () =
 let test_unknown_header () =
   let buf = Httpz.create_buffer () in
   let request = "GET / HTTP/1.1\r\nHost: example.com\r\nX-Custom-Header: custom-value\r\n\r\n" in
-  let len = copy_to_buffer buf request in
-  let #(status, _req, headers) = Httpz.parse buf ~len in
-  assert (Poly.(=) status Httpz.Ok);
+  let #(_len, _req, headers) = parse_ok buf request in
   assert (List.length headers = 2);
   (* Headers are returned in reverse order: X-Custom-Header is first, Host is second *)
   (match headers with
@@ -82,9 +83,7 @@ let test_partial () =
 let test_http10 () =
   let buf = Httpz.create_buffer () in
   let request = "GET / HTTP/1.0\r\n\r\n" in
-  let len = copy_to_buffer buf request in
-  let #(status, req, headers) = Httpz.parse buf ~len in
-  assert (Poly.(=) status Httpz.Ok);
+  let #(_len, req, headers) = parse_ok buf request in
   assert (Poly.(=) req.#version Httpz.HTTP_1_0);
   assert (List.length headers = 0);
   Stdio.printf "test_http10: PASSED\n"
@@ -93,17 +92,13 @@ let test_keep_alive () =
   let buf = Httpz.create_buffer () in
   (* HTTP/1.1 default is keep-alive *)
   let request1 = "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n" in
-  let len1 = copy_to_buffer buf request1 in
-  let #(status1, req1, _headers1) = Httpz.parse buf ~len:len1 in
-  assert (Poly.(=) status1 Httpz.Ok);
+  let #(_len1, req1, _headers1) = parse_ok buf request1 in
   (* Use cached keep_alive from request struct *)
   assert req1.#keep_alive;
 
   (* HTTP/1.0 default is close *)
   let request2 = "GET / HTTP/1.0\r\n\r\n" in
-  let len2 = copy_to_buffer buf request2 in
-  let #(status2, req2, _headers2) = Httpz.parse buf ~len:len2 in
-  assert (Poly.(=) status2 Httpz.Ok);
+  let #(_len2, req2, _headers2) = parse_ok buf request2 in
   assert (not req2.#keep_alive);
 
   Stdio.printf "test_keep_alive: PASSED\n"
@@ -111,9 +106,7 @@ let test_keep_alive () =
 let test_chunked () =
   let buf = Httpz.create_buffer () in
   let request = "POST /upload HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n" in
-  let len = copy_to_buffer buf request in
-  let #(status, req, headers) = Httpz.parse buf ~len in
-  assert (Poly.(=) status Httpz.Ok);
+  let #(_len, req, headers) = parse_ok buf request in
   (* Transfer-Encoding is now cached in request struct and excluded from headers *)
   assert req.#is_chunked;
   (* Only Host header remains *)
@@ -123,9 +116,7 @@ let test_chunked () =
 let test_find_header () =
   let buf = Httpz.create_buffer () in
   let request = "GET / HTTP/1.1\r\nHost: example.com\r\nAccept: text/html\r\n\r\n" in
-  let len = copy_to_buffer buf request in
-  let #(status, _req, headers) = Httpz.parse buf ~len in
-  assert (Poly.(=) status Httpz.Ok);
+  let #(_len, _req, headers) = parse_ok buf request in
   (match Httpz.find_header headers Httpz.H_host with
    | Some hdr -> assert (Httpz.span_equal buf hdr.value "example.com")
    | None -> assert false);

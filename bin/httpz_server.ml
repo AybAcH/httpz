@@ -2,6 +2,7 @@
 
 open Core
 open Async
+open Async.Deferred.Let_syntax
 
 (* Response buffer size - 64KB for headers *)
 let response_buffer_size = 65536
@@ -102,36 +103,36 @@ let serve_file conn ~root target_span version =
   let file_path = normalize_path ~root path in
   (* Check if path is within root (security check) *)
   let root_abs = Filename_unix.realpath root in
-  Sys.file_exists file_path
-  >>= function
+  let%bind file_status = Sys.file_exists file_path in
+  match file_status with
   | `No | `Unknown ->
     send_error conn Httpz.S404_Not_Found "Not Found" version
   | `Yes ->
-    Sys.is_directory file_path
-    >>= function
+    let%bind is_dir = Sys.is_directory file_path in
+    match is_dir with
     | `Yes ->
       (* Try index.html for directories *)
       let index_path = Filename.concat file_path "index.html" in
-      Sys.file_exists index_path
-      >>= (function
-        | `Yes ->
-          Reader.file_contents index_path
-          >>= fun contents ->
-          write_headers conn Httpz.S200_OK "text/html" (String.length contents) version;
-          Writer.write conn.writer contents;
-          Writer.flushed conn.writer
-        | `No | `Unknown ->
-          send_error conn Httpz.S404_Not_Found "Not Found" version)
+      let%bind index_status = Sys.file_exists index_path in
+      (match index_status with
+       | `Yes ->
+         let%bind contents = Reader.file_contents index_path in
+         write_headers conn Httpz.S200_OK "text/html" (String.length contents) version;
+         Writer.write conn.writer contents;
+         Writer.flushed conn.writer
+       | `No | `Unknown ->
+         send_error conn Httpz.S404_Not_Found "Not Found" version)
     | `No | `Unknown ->
       (* Check file is within root *)
-      Monitor.try_with (fun () ->
+      let%bind result = Monitor.try_with (fun () ->
         let file_abs = Filename_unix.realpath file_path in
         if String.is_prefix file_abs ~prefix:root_abs then
-          Reader.file_contents file_path
-          >>| fun contents -> Some contents
+          let%map contents = Reader.file_contents file_path in
+          Some contents
         else
           return None)
-      >>= function
+      in
+      match result with
       | Error _ -> send_error conn Httpz.S404_Not_Found "Not Found" version
       | Ok None -> send_error conn Httpz.S403_Forbidden "Forbidden" version
       | Ok (Some contents) ->
@@ -144,16 +145,15 @@ let serve_file conn ~root target_span version =
 let read_more conn =
   if conn.read_len >= Httpz.buffer_size then
     return `Buffer_full
-  else begin
+  else
     let available = Httpz.buffer_size - conn.read_len in
     let bss = Bigsubstring.create conn.read_buf ~pos:conn.read_len ~len:available in
-    Reader.read_bigsubstring conn.reader bss
-    >>| function
+    let%map result = Reader.read_bigsubstring conn.reader bss in
+    match result with
     | `Eof -> `Eof
     | `Ok n ->
       conn.read_len <- conn.read_len + n;
       `Ok n
-  end
 
 (* Shift buffer contents to remove processed data *)
 let shift_buffer conn consumed =
@@ -183,8 +183,7 @@ let handle_request conn ~root =
       return `Need_more
     else begin
       conn.keep_alive <- req.#keep_alive;
-      serve_file conn ~root target version
-      >>| fun () ->
+      let%map () = serve_file conn ~root target version in
       let consumed = if body_span_len > 0 then
         body_span_off + body_span_len
       else
@@ -197,38 +196,37 @@ let handle_request conn ~root =
     return `Need_more
   | Httpz.Headers_too_large ->
     conn.keep_alive <- false;
-    send_error conn Httpz.S413_Payload_Too_Large "Payload Too Large" Httpz.HTTP_1_1
-    >>| fun () -> `Close
+    let%map () = send_error conn Httpz.S413_Payload_Too_Large "Payload Too Large" Httpz.HTTP_1_1 in
+    `Close
   | _ ->
     conn.keep_alive <- false;
-    send_error conn Httpz.S400_Bad_Request "Bad Request" Httpz.HTTP_1_1
-    >>| fun () -> `Close
+    let%map () = send_error conn Httpz.S400_Bad_Request "Bad Request" Httpz.HTTP_1_1 in
+    `Close
 
 (* Handle connection loop *)
 let handle_connection conn ~root =
   let rec loop () =
-    if conn.read_len = 0 then begin
-      read_more conn
-      >>= function
+    if conn.read_len = 0 then
+      let%bind read_result = read_more conn in
+      match read_result with
       | `Eof -> return ()
       | `Buffer_full ->
         conn.keep_alive <- false;
         send_error conn Httpz.S413_Payload_Too_Large "Payload Too Large" Httpz.HTTP_1_1
       | `Ok _ -> loop ()
-    end else begin
-      handle_request conn ~root
-      >>= function
+    else
+      let%bind req_result = handle_request conn ~root in
+      match req_result with
       | `Continue -> loop ()
       | `Close -> return ()
       | `Need_more ->
-        read_more conn
-        >>= function
+        let%bind read_result = read_more conn in
+        match read_result with
         | `Eof -> return ()
         | `Buffer_full ->
           conn.keep_alive <- false;
           send_error conn Httpz.S413_Payload_Too_Large "Payload Too Large" Httpz.HTTP_1_1
         | `Ok _ -> loop ()
-    end
   in
   loop ()
 
@@ -240,8 +238,7 @@ let handle_client ~root addr reader writer =
     | `Unix path -> path
   in
   let conn = create_conn reader writer in
-  Monitor.try_with (fun () -> handle_connection conn ~root)
-  >>| fun result ->
+  let%map result = Monitor.try_with (fun () -> handle_connection conn ~root) in
   match result with
   | Ok () -> ()
   | Error exn ->
@@ -251,13 +248,13 @@ let handle_client ~root addr reader writer =
 let run ~port ~root () =
   let where_to_listen = Tcp.Where_to_listen.of_port port in
   printf "httpz serving %s on http://localhost:%d/\n%!" root port;
-  Tcp.Server.create
+  let%bind _server = Tcp.Server.create
     ~on_handler_error:`Raise
     ~backlog:128
     ~max_connections:10000
     where_to_listen
     (fun addr reader writer -> handle_client ~root addr reader writer)
-  >>= fun _server ->
+  in
   Deferred.never ()
 
 (* Command-line interface *)
