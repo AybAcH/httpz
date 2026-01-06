@@ -506,21 +506,64 @@ let parse_request_httpz buf data =
   let #(status, req, headers) = Httpz.parse buf ~len in
   (* Extract values to prevent them from being optimized away *)
   let _ = req.#body_off in
+  let _ = headers in
+  status
+
+(* Variant to test if List.length causes allocation *)
+let parse_request_httpz_with_length buf data =
+  let len = copy_to_httpz_buffer buf data in
+  let #(status, req, headers) = Httpz.parse buf ~len in
+  let _ = req.#body_off in
   let _ = List.length headers in
+  status
+
+(* Test just the copy - no parsing *)
+let just_copy_httpz buf data =
+  let len = copy_to_httpz_buffer buf data in
+  len
+
+(* Test parse only - assume data already in buffer *)
+let just_parse_httpz buf len =
+  let #(status, req, headers) = Httpz.parse buf ~len in
+  let _ = req.#body_off in
+  let _ = headers in
   status
 
 (* Httpz parsing benchmarks *)
 let httpz_buf = Httpz.create_buffer ()
+let minimal_len = String.length minimal_request
+let _ = String.length browser_request (* silence warning *)
+
+(* Pre-populate buffer for parse-only test *)
+let () =
+  for i = 0 to minimal_len - 1 do
+    Bigarray.Array1.set httpz_buf i (String.get minimal_request i)
+  done
 
 let httpz_parsing_benchmarks = [
+  Bench.Test.create ~name:"httpz_noop" (fun () ->
+    ());
+
+  Bench.Test.create ~name:"httpz_just_copy" (fun () ->
+    ignore (just_copy_httpz httpz_buf minimal_request));
+
+  Bench.Test.create ~name:"httpz_just_parse" (fun () ->
+    ignore (just_parse_httpz httpz_buf minimal_len));
+
   Bench.Test.create ~name:"httpz_minimal" (fun () ->
     ignore (parse_request_httpz httpz_buf minimal_request));
+
+  Bench.Test.create ~name:"httpz_minimal_len" (fun () ->
+    ignore (parse_request_httpz_with_length httpz_buf minimal_request));
 
   Bench.Test.create ~name:"httpz_simple" (fun () ->
     ignore (parse_request_httpz httpz_buf simple_request));
 
   Bench.Test.create ~name:"httpz_browser" (fun () ->
     ignore (parse_request_httpz httpz_buf browser_request));
+
+  Bench.Test.create ~name:"httpz_browser_len" (fun () ->
+    ignore (parse_request_httpz_with_length httpz_buf browser_request));
 
   Bench.Test.create ~name:"httpz_5_headers" (fun () ->
     ignore (parse_request_httpz httpz_buf request_5_headers));
